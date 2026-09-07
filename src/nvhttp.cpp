@@ -1283,6 +1283,7 @@ namespace nvhttp {
 
     pt::ptree tree;
     bool revert_display_configuration {false};
+    uint32_t virtual_display_owner_id {0};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1295,6 +1296,9 @@ namespace nvhttp {
       response->close_connection_after_response = true;
 
       if (revert_display_configuration) {
+        if (virtual_display_owner_id != 0) {
+          (void) display_device::destroy_virtual_display(virtual_display_owner_id);
+        }
         display_device::revert_configuration();
       }
     });
@@ -1327,7 +1331,18 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
 
-    if (rtsp_stream::session_count() == 0) {
+    const bool no_active_sessions = rtsp_stream::session_count() == 0;
+    if (no_active_sessions) {
+      if (!display_device::reserve_virtual_display(config::video, launch_session->id)) {
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Another launch is already preparing the virtual display");
+        tree.put("root.gamesession", 0);
+        return;
+      }
+      if (config::video.virtual_display) {
+        virtual_display_owner_id = launch_session->id;
+      }
+
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
@@ -1360,6 +1375,13 @@ namespace nvhttp {
       return;
     }
 
+    if (no_active_sessions && !display_device::create_virtual_display(config::video, *launch_session)) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+
     if (appid > 0) {
       auto err = proc::proc.execute((int) appid, launch_session);
       if (err) {
@@ -1369,6 +1391,13 @@ namespace nvhttp {
 
         return;
       }
+    }
+
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch session is already pending");
+      tree.put("root.gamesession", 0);
+      return;
     }
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -1382,8 +1411,6 @@ namespace nvhttp {
       )
     );
     tree.put("root.gamesession", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1400,6 +1427,7 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+    uint32_t virtual_display_owner_id {0};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1410,6 +1438,9 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      if (virtual_display_owner_id != 0) {
+        (void) display_device::destroy_virtual_display(virtual_display_owner_id);
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -1443,6 +1474,16 @@ namespace nvhttp {
     const auto launch_session = make_launch_session(host_audio, args);
 
     if (no_active_sessions) {
+      if (!display_device::reserve_virtual_display(config::video, launch_session->id)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Another launch is already preparing the virtual display");
+        return;
+      }
+      if (config::video.virtual_display) {
+        virtual_display_owner_id = launch_session->id;
+      }
+
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
@@ -1472,6 +1513,22 @@ namespace nvhttp {
       return;
     }
 
+    if (no_active_sessions) {
+      if (!display_device::create_virtual_display(config::video, *launch_session)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
+        return;
+      }
+    }
+
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch session is already pending");
+      return;
+    }
+
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(
       "root.sessionUrl0",
@@ -1484,7 +1541,7 @@ namespace nvhttp {
     );
     tree.put("root.resume", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    virtual_display_owner_id = 0;
   }
 
   /**
@@ -1515,6 +1572,7 @@ namespace nvhttp {
     }
 
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
+    display_device::destroy_virtual_display();
     display_device::revert_configuration();
   }
 

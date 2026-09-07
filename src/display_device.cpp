@@ -33,6 +33,8 @@
 #endif
 
 #ifdef __APPLE__
+  #include "platform/macos/virtual_display.h"
+
   #include <display_device/macos/display_power.h>
   #include <display_device/macos/mac_api_layer.h>
   #include <display_device/macos/mac_display_device.h>
@@ -51,6 +53,9 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
     } DD_DATA;
+
+    std::mutex VIRTUAL_DISPLAY_MUTEX;  ///< Serializes native virtual-display ownership and lifecycle calls.
+    virtual_display_ownership_t VIRTUAL_DISPLAY_OWNERSHIP;  ///< Tracks the launch session allowed to mutate the virtual display.
 
     /**
      * @brief Helper class for capturing audio context when the API demands it.
@@ -759,6 +764,39 @@ namespace display_device {
     }
   }  // namespace
 
+  bool virtual_display_ownership_t::reserve(uint32_t launch_session_id) {
+    if (launch_session_id == 0 || (owner_id_ && *owner_id_ != launch_session_id)) {
+      return false;
+    }
+    owner_id_ = launch_session_id;
+    return true;
+  }
+
+  bool virtual_display_ownership_t::mark_created(uint32_t launch_session_id) {
+    if (!owner_id_ || *owner_id_ != launch_session_id) {
+      return false;
+    }
+    created_ = true;
+    return true;
+  }
+
+  bool virtual_display_ownership_t::is_created_by(uint32_t launch_session_id) const {
+    return created_ && owner_id_ && *owner_id_ == launch_session_id;
+  }
+
+  bool virtual_display_ownership_t::release(uint32_t launch_session_id) {
+    if (!owner_id_ || *owner_id_ != launch_session_id) {
+      return false;
+    }
+    reset();
+    return true;
+  }
+
+  void virtual_display_ownership_t::reset() {
+    owner_id_.reset();
+    created_ = false;
+  }
+
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
     std::lock_guard lock {DD_DATA.mutex};
     // We can support re-init without any issues, however we should make sure to clean up first!
@@ -785,6 +823,7 @@ namespace display_device {
     class deinit_t: public platf::deinit_t {
     public:
       ~deinit_t() override {
+        destroy_virtual_display();
         std::lock_guard lock {DD_DATA.mutex};
         try {
           // This may throw if used incorrectly. At the moment this will not happen, however
@@ -857,6 +896,79 @@ namespace display_device {
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
     // Error details should already be logged for failed_to_parse_tag_t case, and we also don't
     // want to revert active configuration in case we have any
+  }
+
+  bool reserve_virtual_display(const config::video_t &video_config, uint32_t launch_session_id) {
+    if (!video_config.virtual_display) {
+      return true;
+    }
+    std::lock_guard lock {VIRTUAL_DISPLAY_MUTEX};
+    if (!VIRTUAL_DISPLAY_OWNERSHIP.reserve(launch_session_id)) {
+      BOOST_LOG(warning) << "Another pending launch owns the virtual display";
+      return false;
+    }
+    return true;
+  }
+
+  bool create_virtual_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    if (!video_config.virtual_display) {
+      return true;
+    }
+    // Validate before spawning or changing the desktop. WindowServer and the
+    // encoder must never receive zero, negative, or unbounded mode dimensions.
+    if (session.width <= 0 || session.height <= 0 || session.width > 16384 || session.height > 16384 || session.fps <= 0 || session.fps > 240) {
+      BOOST_LOG(error) << "Invalid virtual display dimensions or refresh rate";
+      return false;
+    }
+    std::lock_guard lock {VIRTUAL_DISPLAY_MUTEX};
+#ifdef __APPLE__
+    if (!VIRTUAL_DISPLAY_OWNERSHIP.reserve(session.id)) {
+      BOOST_LOG(warning) << "Another pending launch owns the virtual display";
+      return false;
+    }
+    if (VIRTUAL_DISPLAY_OWNERSHIP.is_created_by(session.id) && ::virtual_display_get_id() != 0) {
+      return true;
+    }
+    if (::virtual_display_get_id() != 0) {
+      BOOST_LOG(warning) << "Replacing an unowned or stale virtual display";
+      ::virtual_display_destroy();
+    }
+    const auto display_id = ::virtual_display_create(session.width, session.height, session.fps, video_config.virtual_display_exclusive);
+    if (display_id == 0) {
+      // Clear the helper's requested state as well as our reservation. The
+      // ownership mutex proves that no other launch can own this helper.
+      ::virtual_display_destroy();
+      (void) VIRTUAL_DISPLAY_OWNERSHIP.release(session.id);
+      BOOST_LOG(error) << "Could not create the requested virtual display";
+      return false;
+    }
+    (void) VIRTUAL_DISPLAY_OWNERSHIP.mark_created(session.id);
+    BOOST_LOG(info) << "Created virtual display " << display_id << " (" << session.width << "x" << session.height << "@" << session.fps << "Hz)";
+    return true;
+#else
+    (void) VIRTUAL_DISPLAY_OWNERSHIP.release(session.id);
+    BOOST_LOG(error) << "Automatic virtual displays are supported only on macOS";
+    return false;
+#endif
+  }
+
+  bool destroy_virtual_display(uint32_t launch_session_id) {
+    std::lock_guard lock {VIRTUAL_DISPLAY_MUTEX};
+    if (!VIRTUAL_DISPLAY_OWNERSHIP.release(launch_session_id)) {
+      return false;
+    }
+#ifdef __APPLE__
+    ::virtual_display_destroy();
+#endif
+    return true;
+  }
+
+  void destroy_virtual_display() {
+    std::lock_guard lock {VIRTUAL_DISPLAY_MUTEX};
+#ifdef __APPLE__
+    ::virtual_display_destroy();
+#endif
+    VIRTUAL_DISPLAY_OWNERSHIP.reset();
   }
 
   void configure_display(const SingleDisplayConfiguration &config) {

@@ -16,8 +16,10 @@
 #include "src/platform/common.h"
 #include "src/platform/macos/av_img_t.h"
 #include "src/platform/macos/av_video.h"
+#include "src/platform/macos/input_target.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#include "src/platform/macos/virtual_display.h"
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 /**
@@ -222,9 +224,19 @@ namespace platf {
 
     auto display = std::make_shared<av_display_t>();
 
-    BOOST_LOG(debug) << "Waking display for capture selector ["sv << display_name << ']';
-    if (!display_device::wake_display(display_name, 1s)) {
-      BOOST_LOG(debug) << "Display wake attempt did not expose the requested display ["sv << display_name << ']';
+    virtual_display_state_t virtual_display_state {};
+    ::virtual_display_get_state(&virtual_display_state);
+    const auto virtual_display_id = virtual_display_state.display_id;
+    if (virtual_display_state.requested && virtual_display_id == 0) {
+      BOOST_LOG(error) << "The session virtual display is unavailable"sv;
+      return nullptr;
+    }
+    // Waking the configured physical display would undo exclusive virtual mode.
+    if (virtual_display_id == 0) {
+      BOOST_LOG(debug) << "Waking display for capture selector ["sv << display_name << ']';
+      if (!display_device::wake_display(display_name, 1s)) {
+        BOOST_LOG(debug) << "Display wake attempt did not expose the requested display ["sv << display_name << ']';
+      }
     }
 
     display->display_power_guard = display_device::keep_display_awake("Sunshine display capture");
@@ -237,7 +249,9 @@ namespace platf {
     // Default to main display
     display->display_id = CGMainDisplayID();
 
-    if (const auto configured_display_id {parse_display_id(display_name)}) {
+    if (virtual_display_id != 0) {
+      display->display_id = virtual_display_id;
+    } else if (const auto configured_display_id {parse_display_id(display_name)}) {
       display->display_id = *configured_display_id;
     } else if (!display_name.empty()) {
       BOOST_LOG(warning) << "Configured display ["sv << display_name
@@ -265,6 +279,8 @@ namespace platf {
       return nullptr;
     }
 
+    macos_input::set_capture_display(display->display_id);
+
     display->width = display->av_capture.frameWidth;
     display->height = display->av_capture.frameHeight;
     // We also need set env_width and env_height for absolute mouse coordinates
@@ -283,6 +299,15 @@ namespace platf {
   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
     std::vector<std::string> display_names;
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
+      return display_names;
+    }
+
+    virtual_display_state_t virtual_display_state {};
+    ::virtual_display_get_state(&virtual_display_state);
+    if (virtual_display_state.requested) {
+      if (virtual_display_state.display_id != 0) {
+        display_names.emplace_back(std::to_string(virtual_display_state.display_id));
+      }
       return display_names;
     }
 

@@ -6,8 +6,10 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 
 // lib includes
@@ -28,6 +30,50 @@ namespace rtsp_stream {
 }
 
 namespace display_device {
+  /**
+   * @brief Track the launch session that owns the virtual-display lifecycle.
+   * @note This class contains no platform calls and is not internally synchronized.
+   */
+  class virtual_display_ownership_t {
+  public:
+    /**
+     * @brief Reserve the lifecycle for a launch session.
+     * @param launch_session_id Launch-session identifier requesting ownership.
+     * @return True when ownership was acquired or already belongs to the caller.
+     */
+    [[nodiscard]] bool reserve(uint32_t launch_session_id);
+
+    /**
+     * @brief Mark the owning session's native virtual display as created.
+     * @param launch_session_id Launch-session identifier claiming creation.
+     * @return True when the caller owns the lifecycle and the state was updated.
+     */
+    [[nodiscard]] bool mark_created(uint32_t launch_session_id);
+
+    /**
+     * @brief Check whether the owning session has created its native display.
+     * @param launch_session_id Launch-session identifier to inspect.
+     * @return True when the caller owns a created virtual display.
+     */
+    [[nodiscard]] bool is_created_by(uint32_t launch_session_id) const;
+
+    /**
+     * @brief Release the lifecycle only when it belongs to the caller.
+     * @param launch_session_id Launch-session identifier requesting release.
+     * @return True when ownership was released.
+     */
+    [[nodiscard]] bool release(uint32_t launch_session_id);
+
+    /**
+     * @brief Clear ownership for forced shutdown or cancellation.
+     */
+    void reset();
+
+  private:
+    std::optional<uint32_t> owner_id_;  ///< Launch session holding the lifecycle reservation.
+    bool created_ {false};  ///< Whether the owner has created the native display.
+  };
+
   /**
    * @brief Initialize the implementation and perform the initial state recovery (if needed).
    * @param persistence_filepath File location for reading/saving persistent state.
@@ -103,6 +149,35 @@ namespace display_device {
    * @examples_end
    */
   void configure_display(const SingleDisplayConfiguration &config);
+
+  /**
+   * @brief Reserve virtual-display setup for one launch session.
+   * @param video_config Display configuration, including the opt-in virtual-display policy.
+   * @param launch_session_id Launch-session identifier requesting the reservation.
+   * @return True when disabled or reserved; false when another launch owns the lifecycle.
+   */
+  [[nodiscard]] bool reserve_virtual_display(const config::video_t &video_config, uint32_t launch_session_id);
+
+  /**
+   * @brief Prepare a temporary macOS display after encoder probing succeeds.
+   * @param video_config Display configuration, including the opt-in virtual-display policy.
+   * @param session Client-requested dimensions and refresh rate.
+   * @return True when disabled or ready; false when the requested virtual display cannot be created.
+   */
+  [[nodiscard]] bool create_virtual_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
+
+  /**
+   * @brief Release a virtual display only when it belongs to a launch session.
+   * @param launch_session_id Launch-session identifier requesting cleanup.
+   * @return True when the caller owned and released the lifecycle.
+   */
+  [[nodiscard]] bool destroy_virtual_display(uint32_t launch_session_id);
+
+  /**
+   * @brief Release a temporary virtual display and its session-only layout.
+   * @note Safe to call when no virtual display exists and on non-macOS platforms.
+   */
+  void destroy_virtual_display();
 
   /**
    * @brief Revert the display configuration and restore the previous state.

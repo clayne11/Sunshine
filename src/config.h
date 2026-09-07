@@ -122,6 +122,8 @@ namespace config {
     std::string encoder;  ///< Encoder backend name selected by configuration.
     std::string adapter_name;  ///< Display adapter name selected in configuration.
     std::string output_name;  ///< Display output name selected in configuration.
+    bool virtual_display;  ///< Create a temporary macOS display matching the client session.
+    bool virtual_display_exclusive;  ///< Temporarily make that virtual display the only active display.
 
     /**
      * @brief Display-device integration settings.

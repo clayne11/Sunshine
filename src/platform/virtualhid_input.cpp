@@ -22,6 +22,10 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "virtualhid_input.h"
+#ifdef __APPLE__
+  #include "src/platform/macos/input_geometry.h"
+  #include "src/platform/macos/input_target.h"
+#endif
 
 using namespace std::literals;
 
@@ -759,12 +763,48 @@ namespace platf::virtualhid {
 
   void move_mouse(input_context_t &context, int delta_x, int delta_y) {
     if (context.mouse) {
-      log_failure("submit libvirtualhid mouse movement"sv, context.mouse->move_relative(delta_x, delta_y));
+      lvh::MouseEvent event {.kind = lvh::MouseEventKind::relative_motion, .x = delta_x, .y = delta_y};
+#ifdef __APPLE__
+      const auto target = macos_input::resolve_pointer_target();
+      if (!target) {
+        BOOST_LOG(warning) << "Ignoring relative mouse input without an active target display"sv;
+        return;
+      }
+      event.viewport = {.offset_x = target->offset_x, .offset_y = target->offset_y, .width = target->width, .height = target->height};
+#endif
+      log_failure("submit libvirtualhid mouse movement"sv, context.mouse->submit(event));
     }
   }
 
   void abs_mouse(input_context_t &context, const touch_port_t &touch_port, float x, float y) {
     if (context.mouse) {
+#ifdef __APPLE__
+      const auto target = macos_input::resolve_pointer_target();
+      const auto local = macos_input::local_absolute_point(
+        {x, y},
+        {static_cast<double>(touch_port.offset_x),
+         static_cast<double>(touch_port.offset_y),
+         static_cast<double>(touch_port.width),
+         static_cast<double>(touch_port.height)}
+      );
+      if (!target || !local) {
+        BOOST_LOG(warning) << "Ignoring absolute mouse input with invalid target geometry"sv;
+        return;
+      }
+
+      lvh::MouseEvent event {
+        .kind = lvh::MouseEventKind::absolute_motion,
+        .x = static_cast<std::int32_t>(std::lround(local->x)),
+        .y = static_cast<std::int32_t>(std::lround(local->y)),
+        .absolute_x = static_cast<float>(local->x),
+        .absolute_y = static_cast<float>(local->y),
+        .has_fractional_absolute_coordinates = true,
+        .width = touch_port.width,
+        .height = touch_port.height,
+        .viewport = {.offset_x = target->offset_x, .offset_y = target->offset_y, .width = target->width, .height = target->height},
+      };
+      log_failure("submit libvirtualhid absolute mouse movement"sv, context.mouse->submit(event));
+#else
       log_failure(
         "submit libvirtualhid absolute mouse movement"sv,
         context.mouse->move_absolute(
@@ -774,6 +814,7 @@ namespace platf::virtualhid {
           touch_port.height
         )
       );
+#endif
     }
   }
 
@@ -784,7 +825,16 @@ namespace platf::virtualhid {
         return;
       }
 
-      log_failure("submit libvirtualhid mouse button"sv, context.mouse->button(*converted, !release));
+      lvh::MouseEvent event {.kind = lvh::MouseEventKind::button, .button = *converted, .pressed = !release};
+#ifdef __APPLE__
+      const auto target = macos_input::resolve_pointer_target();
+      if (!target) {
+        BOOST_LOG(warning) << "Ignoring mouse button input without an active target display"sv;
+        return;
+      }
+      event.viewport = {.offset_x = target->offset_x, .offset_y = target->offset_y, .width = target->width, .height = target->height};
+#endif
+      log_failure("submit libvirtualhid mouse button"sv, context.mouse->submit(event));
     }
   }
 

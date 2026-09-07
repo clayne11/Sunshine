@@ -32,6 +32,7 @@
 
 // local includes
 #include "misc.h"
+#include "src/display_device.h"
 #include "src/entry_handler.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -266,7 +267,7 @@ namespace platf {
   }
 
   void streaming_will_stop() {
-    // Nothing to do
+    display_device::destroy_virtual_display();
   }
 
   static pid_t g_restart_child_pid = 0;  ///< PID of the restarted child process for signal forwarding.

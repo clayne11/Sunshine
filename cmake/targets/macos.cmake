@@ -24,3 +24,30 @@ endif()
 
 # Tell linker to dynamically load these symbols at runtime, in case they're unavailable:
 target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,-U,_CGRequestScreenCaptureAccess)
+
+# Keep private virtual-display APIs in a small helper process. Its lifetime
+# follows Sunshine, and the controller expects it beside the server executable.
+add_executable(vd_helper "${CMAKE_SOURCE_DIR}/src/platform/macos/vd_helper.m")
+set_source_files_properties(
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/vd_helper.m"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+target_link_libraries(vd_helper PRIVATE
+        "-framework Foundation"
+        "-framework AppKit"
+        "-framework CoreGraphics"
+        "-F/System/Library/PrivateFrameworks"
+        "-framework SkyLight")
+add_dependencies(sunshine vd_helper)
+
+if(SUNSHINE_BUILD_HOMEBREW)
+    install(TARGETS vd_helper RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+else()
+    add_custom_command(TARGET sunshine POST_BUILD
+            COMMENT "Copying virtual-display helper into the app bundle"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:vd_helper>" "$<TARGET_FILE_DIR:sunshine>/vd_helper"
+            VERBATIM)
+    install(TARGETS vd_helper
+            RUNTIME DESTINATION "${CMAKE_PROJECT_NAME}.app/Contents/MacOS"
+            COMPONENT Runtime)
+endif()

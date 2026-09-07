@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -23,6 +24,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -590,26 +592,40 @@ namespace rtsp_stream {
      * @note If the client does not begin streaming within the ping_timeout,
      *       the session will be discarded.
      * @param launch_session Streaming session information.
+     * @return True when queued; false when another launch session is already pending.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    [[nodiscard]] bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      std::lock_guard lock {_launch_mutex};
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
-        return;
+        return false;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
+      const auto launch_session_id = launch_session->id;
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, launch_session_id](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
+          std::shared_ptr<launch_session_t> discarded;
+          {
+            std::lock_guard lock {_launch_mutex};
+            const auto pending = launch_event.view(0s);
+            if (pending && pending->id == launch_session_id) {
+              discarded = launch_event.pop(0s);
+            }
+          }
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            if (session_count() == 0) {
+              (void) display_device::destroy_virtual_display(discarded->id);
+            }
           }
         }
       });
+      return true;
     }
 
     /**
@@ -617,6 +633,7 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lock {_launch_mutex};
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -642,6 +659,21 @@ namespace rtsp_stream {
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
+     * @brief Cancel and remove the pending launch session, if any.
+     */
+    void clear_pending() {
+      std::shared_ptr<launch_session_t> discarded;
+      {
+        std::lock_guard lock {_launch_mutex};
+        raised_timer.cancel();
+        discarded = launch_event.pop(0s);
+      }
+      if (discarded) {
+        (void) display_device::destroy_virtual_display(discarded->id);
+      }
+    }
+
+    /**
      * @brief Clear launch sessions.
      * @param all If true, clear all sessions. Otherwise, only clear timed out and stopped sessions.
      * @examples
@@ -649,17 +681,22 @@ namespace rtsp_stream {
      * @examples_end
      */
     void clear(bool all = true) {
-      auto lg = _session_slots.lock();
+      if (all) {
+        clear_pending();
+      }
+      {
+        auto lg = _session_slots.lock();
 
-      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
-        auto &slot = *(*i);
-        if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
-          stream::session::stop(slot);
-          stream::session::join(slot);
+        for (auto i = _session_slots->begin(); i != _session_slots->end();) {
+          auto &slot = *(*i);
+          if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
+            stream::session::stop(slot);
+            stream::session::join(slot);
 
-          i = _session_slots->erase(i);
-        } else {
-          i++;
+            i = _session_slots->erase(i);
+          } else {
+            i++;
+          }
         }
       }
     }
@@ -695,11 +732,19 @@ namespace rtsp_stream {
     /**
      * @brief Inserts the provided session into the set of sessions.
      * @param session The session to insert.
+     * @param launch_session_id Pending launch identifier authorizing insertion.
+     * @return True when the launch remains pending and the session was inserted.
      */
-    void insert(const std::shared_ptr<stream::session_t> &session) {
+    [[nodiscard]] bool insert(const std::shared_ptr<stream::session_t> &session, uint32_t launch_session_id) {
       auto lg = _session_slots.lock();
+      std::lock_guard launch_lock {_launch_mutex};
+      const auto pending = launch_event.view(0s);
+      if (!pending || pending->id != launch_session_id) {
+        return false;
+      }
       _session_slots->emplace(session);
       BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
+      return true;
     }
 
     /**
@@ -727,6 +772,7 @@ namespace rtsp_stream {
   private:
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
+    std::mutex _launch_mutex;  ///< Serializes pending launch admission, timeout, and removal.
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
 
     boost::asio::io_context io_context;
@@ -741,8 +787,8 @@ namespace rtsp_stream {
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
@@ -1299,7 +1345,10 @@ namespace rtsp_stream {
     }
 
     auto stream_session = stream::session::alloc(config, session);
-    server->insert(stream_session);
+    if (!server->insert(stream_session, session.id)) {
+      respond(sock, session, &option, 503, "Service Unavailable", req->sequenceNumber, {});
+      return;
+    }
 
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
