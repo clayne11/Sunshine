@@ -1045,6 +1045,59 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### virtual_display
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            On macOS, create a temporary virtual display for each client session. The display matches the client's
+            requested width, height, and frame rate. The expected behavior is for Sunshine to remove the display after
+            the last client disconnects and clean it up if startup fails.
+            @note{This option is only supported on macOS.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### virtual_display_exclusive
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            On macOS, temporarily disable other displays while streaming on the virtual display. The expected behavior
+            is for Sunshine to restore the other displays when the last client disconnects or Sunshine exits.
+            @note{This option is only effective when [virtual_display](#virtual_display) is enabled and is only
+            supported on macOS.}
+            @warning{Validate display restoration on the target system before relying on this option.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display_exclusive = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### dd_configuration_option
 
 <table>

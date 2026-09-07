@@ -1,5 +1,5 @@
 <script setup>
-import {ref} from 'vue'
+import {computed, ref} from 'vue'
 import {$tp} from '../../platform-i18n'
 import PlatformLayout from '../../PlatformLayout.vue'
 import AdapterNameSelector from './audiovideo/AdapterNameSelector.vue'
@@ -14,6 +14,18 @@ const props = defineProps([
 ])
 
 const config = ref(props.config)
+
+const virtualDisplayEnabled = computed(() => {
+  const value = config.value.virtual_display
+  return value === true || value === 1 || [
+    'true',
+    'yes',
+    'enable',
+    'enabled',
+    'on',
+    '1',
+  ].includes(`${value}`.toLowerCase().trim())
+})
 </script>
 
 <template>
@@ -74,6 +86,26 @@ const config = ref(props.config)
               v-model="config.stream_audio"
               default="true"
     ></Checkbox>
+
+    <!-- macOS Virtual Display -->
+    <PlatformLayout :platform="platform">
+      <template #macos>
+        <Checkbox class="mb-3"
+                  id="virtual_display"
+                  locale-prefix="config"
+                  v-model="config.virtual_display"
+                  default="false"
+        ></Checkbox>
+
+        <Checkbox v-if="virtualDisplayEnabled"
+                  class="mb-3"
+                  id="virtual_display_exclusive"
+                  locale-prefix="config"
+                  v-model="config.virtual_display_exclusive"
+                  default="false"
+        ></Checkbox>
+      </template>
+    </PlatformLayout>
 
     <AdapterNameSelector
         :platform="platform"
