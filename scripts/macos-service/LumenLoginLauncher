@@ -1,0 +1,76 @@
+#!/bin/zsh
+# Lumen's login-session launcher.
+#
+# This file is installed at:
+#   ~/Applications/Lumen Login Launcher.app/Contents/MacOS/LumenLoginLauncher
+# Keep that path stable: the launchd job and the user's macOS privacy grants
+# depend on the existing app-bundle identity.
+
+set -u
+
+user_name="${USER:-$(/usr/bin/id -un)}"
+user_home="${HOME:-}"
+if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+  user_home=$(/usr/bin/dscl . -read "/Users/$user_name" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+fi
+if [[ -z "$user_home" ]]; then
+  user_home="/Users/$user_name"
+fi
+
+export HOME="$user_home"
+export USER="$user_name"
+export LOGNAME="$user_name"
+export PATH="$user_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+log_dir="$user_home/Library/Logs"
+launcher_log="$log_dir/lumen-login-launcher.log"
+lumen_bin="${LUMEN_BIN:-$user_home/.local/bin/lumen}"
+listen_port="${LUMEN_PORT:-47990}"
+poll_seconds="${LUMEN_PORT_POLL_SECONDS:-5}"
+runtime_config="${LUMEN_CONFIG:-${SUNSHINE_CONFIG:-}}"
+
+/bin/mkdir -p "$log_dir"
+
+timestamp() {
+  /bin/date '+%Y-%m-%d %H:%M:%S %z'
+}
+
+log() {
+  /bin/echo "[$(timestamp)] $*" >> "$launcher_log"
+}
+
+if [[ "$listen_port" != <-> ]] || (( listen_port < 1024 || listen_port > 65535 )); then
+  log "invalid listener port: $listen_port"
+  exit 64
+fi
+if [[ "$poll_seconds" != <-> ]] || (( poll_seconds < 1 )); then
+  log "invalid listener poll interval: $poll_seconds"
+  exit 64
+fi
+
+if [[ ! -x "$lumen_bin" ]]; then
+  log "missing executable: $lumen_bin"
+  exit 78
+fi
+
+# A previous Lumen process can still be winding down when launchd starts this
+# job. Wait for the listener to disappear instead of returning success: with
+# KeepAlive=true a successful return would otherwise create a restart loop, and
+# starting a second Sunshine instance would race for the same ports.
+while /usr/sbin/lsof -nP -a -iTCP:"$listen_port" -sTCP:LISTEN >/dev/null 2>&1; do
+  listener_pids=$(/usr/sbin/lsof -nP -t -a -iTCP:"$listen_port" -sTCP:LISTEN 2>/dev/null | /usr/bin/sort -u | /usr/bin/tr '\n' ' ')
+  log "port $listen_port is already listening (pids: ${listener_pids:-unknown}); waiting"
+  /bin/sleep "$poll_seconds"
+done
+
+if [[ "$lumen_bin" == "$user_home/.local/bin/lumen" && ! -f "$user_home/.local/share/lumen/.permissions_configured" ]]; then
+  log "permission marker is missing; refusing non-interactive launch"
+  exit 78
+fi
+
+log "starting runtime from app-bundle launcher: $lumen_bin"
+cd "$user_home" || exit 1
+if [[ -n "$runtime_config" ]]; then
+  exec "$lumen_bin" "$runtime_config" "$@"
+fi
+exec "$lumen_bin" "$@"

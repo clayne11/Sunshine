@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.clayne.lumen</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@LAUNCHER_PATH@</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@HOME@</string>
+    <key>USER</key>
+    <string>@USER@</string>
+    <key>LOGNAME</key>
+    <string>@USER@</string>
+    <key>PATH</key>
+    <string>@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LUMEN_BIN</key>
+    <string>@LUMEN_BIN@</string>
+    <key>LUMEN_CONFIG</key>
+    <string>@LUMEN_CONFIG@</string>
+    <key>LUMEN_PORT</key>
+    <string>@LUMEN_PORT@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/lumen-login-launcher.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/lumen-login-launcher.stderr.log</string>
+</dict>
+</plist>
