@@ -63,10 +63,10 @@ static BOOL waitForDisplayReady(CGDirectDisplayID displayID) {
 /**
  * @brief Reap a child without blocking indefinitely.
  * @param pid Child process identifier.
+ * @param attempts Number of nonblocking wait attempts.
  * @return YES when the child was reaped or was already gone.
  */
-static BOOL reapHelper(pid_t pid) {
-  static const unsigned int attempts = 40;
+static BOOL reapHelper(pid_t pid, unsigned int attempts) {
   static const useconds_t interval = 50000;
   int status = 0;
   for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
@@ -91,20 +91,22 @@ static BOOL reapHelper(pid_t pid) {
  * @return YES when the child was reaped or was already gone.
  */
 static BOOL stopHelper(pid_t pid) {
+  static const unsigned int gracefulAttempts = 300;
+  static const unsigned int forcedAttempts = 40;
   if (pid <= 0) {
     return YES;
   }
   if (kill(pid, SIGTERM) < 0 && errno != ESRCH) {
     NSLog(@"[Sunshine] Failed to stop vd_helper pid=%d: %s", pid, strerror(errno));
   }
-  if (reapHelper(pid)) {
+  if (reapHelper(pid, gracefulAttempts)) {
     return YES;
   }
   NSLog(@"[Sunshine] vd_helper pid=%d did not exit after SIGTERM; sending SIGKILL", pid);
   if (kill(pid, SIGKILL) < 0 && errno != ESRCH) {
     NSLog(@"[Sunshine] Failed to kill vd_helper pid=%d: %s", pid, strerror(errno));
   }
-  return reapHelper(pid);
+  return reapHelper(pid, forcedAttempts);
 }
 
 /**
@@ -234,7 +236,7 @@ uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) 
   };
 
   pid_t pid;
-  int err = vd_spawn_with_cloexec(&pid, argv[0], pipefd[1], pipefd[0], (char *const *) argv, environ);
+  int err = vd_spawn_with_cloexec(&pid, argv[0], pipefd[1], pipefd[0], true, (char *const *) argv, environ);
 
   // Close write end in parent
   close(pipefd[1]);

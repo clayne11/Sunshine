@@ -7,12 +7,15 @@
  * Outputs: displayID on stdout (or "0" on failure)
  * Stays alive holding the display until SIGTERM is received.
  *
- * CGVirtualDisplay creates the display object, then we:
- *   1. SLSConfigureDisplayEnabled activates it in WindowServer's display list
+ * CGVirtualDisplay creates and registers the display object, then we:
+ *   1. CGConfigureDisplayOrigin places it beside the main display
  *   2. CGConfigureDisplayMirrorOfDisplay(kCGNullDirectDisplay) forces extend mode
  *      (macOS may auto-mirror new displays, hiding them from CGGetActiveDisplayList)
+ *   3. In exclusive mode, SLSConfigureDisplayEnabled disables the saved physical displays
  * Compiled with ARC (-fobjc-arc).
  */
+#include "vd_spawn.h"
+
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <errno.h>
@@ -22,7 +25,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 /** @brief A mode exposed by the private CGVirtualDisplay API. */
 @interface CGVirtualDisplayMode: NSObject
@@ -97,45 +104,22 @@
 - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
 @end
 
-// SkyLight private C functions for display configuration (linked directly).
+// SkyLight private C functions for physical display enablement (linked directly).
 /**
- * @brief Begin a private display configuration transaction.
- * @param config Receives the configuration reference.
- * @return CoreGraphics error code.
- */
-extern CGError SLSBeginDisplayConfiguration(CGDisplayConfigRef *config);
-/**
- * @brief Set display enablement within a configuration transaction.
+ * @brief Set physical display enablement within a configuration transaction.
  * @param config Configuration reference.
  * @param displayID Display identifier.
  * @param enabled Whether to enable the display.
  * @return CoreGraphics error code.
  */
 extern CGError SLSConfigureDisplayEnabled(CGDisplayConfigRef config, CGDirectDisplayID displayID, bool enabled);
-/**
- * @brief Set display origin within a configuration transaction.
- * @param config Configuration reference.
- * @param displayID Display identifier.
- * @param x Horizontal origin.
- * @param y Vertical origin.
- * @return CoreGraphics error code.
- */
-extern CGError SLSConfigureDisplayOrigin(CGDisplayConfigRef config, CGDirectDisplayID displayID, int32_t x, int32_t y);
-/**
- * @brief Complete a private display configuration transaction.
- * @param config Configuration reference.
- * @param option Configuration scope.
- * @param flags Completion flags.
- * @return CoreGraphics error code.
- */
-extern CGError SLSCompleteDisplayConfiguration(CGDisplayConfigRef config, CGConfigureOption option, uint32_t flags);
 
 // Static storage to keep objects alive (ARC retains static references).
 static CGVirtualDisplay *keepAlive = nil;
 static CGVirtualDisplayDescriptor *keepDesc = nil;
 
 static volatile sig_atomic_t shouldExit = 0;  ///< Set by the async-safe signal handler.
-static pid_t originalParentPID = 0;  ///< Sunshine's PID captured before setup.
+static pid_t originalParentPID = 0;  ///< Direct parent's PID captured before setup.
 static CGDirectDisplayID originalDisplayIDs[64];  ///< Displays active before creation.
 static uint32_t originalDisplayCount = 0;  ///< Number of saved display IDs.
 static CGDirectDisplayID originalOnlineDisplayIDs[64];  ///< All physical displays online before creation.
@@ -152,7 +136,7 @@ static void handle_signal(int sig) {
 }
 
 /**
- * @brief Check whether the Sunshine process that launched this helper remains alive.
+ * @brief Check whether the process that launched the current helper role remains alive.
  * @return YES while the original parent process still owns the helper.
  */
 static BOOL parentIsAlive(void) {
@@ -268,25 +252,40 @@ static BOOL displayIDIsInList(const CGDirectDisplayID *displays, uint32_t displa
 }
 
 /**
- * @brief Check that the active display list has returned to the saved snapshot.
- * @param virtualID Virtual display identifier to exclude from the snapshot.
- * @return YES when every saved display is active and the virtual display is absent.
+ * @brief Check that physical active displays match the saved snapshot.
+ * @param virtualID Virtual display identifier to ignore while it is still held by the helper.
+ * @return YES when the active displays, excluding virtualID, exactly match the saved snapshot.
  */
 static BOOL originalDisplaysAreActive(CGDirectDisplayID virtualID) {
   CGDirectDisplayID activeDisplays[64];
   uint32_t displayCount = 0;
-  if (CGGetActiveDisplayList(64, activeDisplays, &displayCount) != kCGErrorSuccess ||
-      displayCount != originalDisplayCount) {
+  if (CGGetActiveDisplayList(64, activeDisplays, &displayCount) != kCGErrorSuccess) {
     return NO;
   }
 
+  uint32_t remainingCount = 0;
+  for (uint32_t activeIndex = 0; activeIndex < displayCount; ++activeIndex) {
+    if (activeDisplays[activeIndex] == virtualID) {
+      continue;
+    }
+    if (!displayIDIsInList(originalDisplayIDs, originalDisplayCount, activeDisplays[activeIndex])) {
+      return NO;
+    }
+    ++remainingCount;
+  }
+
+  uint32_t savedPhysicalCount = 0;
   for (uint32_t originalIndex = 0; originalIndex < originalDisplayCount; ++originalIndex) {
-    if (!displayIDIsInList(activeDisplays, displayCount, originalDisplayIDs[originalIndex]) ||
-        originalDisplayIDs[originalIndex] == virtualID) {
+    const CGDirectDisplayID displayID = originalDisplayIDs[originalIndex];
+    if (displayID == virtualID) {
+      continue;
+    }
+    ++savedPhysicalCount;
+    if (!displayIDIsInList(activeDisplays, displayCount, displayID)) {
       return NO;
     }
   }
-  return YES;
+  return remainingCount == savedPhysicalCount;
 }
 
 /**
@@ -296,24 +295,27 @@ static BOOL originalDisplaysAreActive(CGDirectDisplayID virtualID) {
  */
 static BOOL waitForOriginalDisplays(CGDirectDisplayID virtualID) {
   static const unsigned int attempts = 40;
-  static const useconds_t interval = 50000;
+  static const CFTimeInterval interval = 0.05;
   for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
+    // CoreGraphics display notifications update process-local state through
+    // the run loop. Pump it before inspecting the post-transaction layout.
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, interval, false);
     if (originalDisplaysAreActive(virtualID)) {
       return YES;
     }
-    usleep(interval);
   }
   return originalDisplaysAreActive(virtualID);
 }
 
 /**
- * @brief Restore the pre-session display enablement and disable the virtual display.
- * @param virtualID Virtual display identifier.
- * @return YES when the app-only restoration completed successfully.
+ * @brief Restore the pre-session physical display enablement.
+ * @param virtualID Last virtual display identifier, ignored during physical-set validation.
+ * @param option Lifetime for the completed restoration transaction.
+ * @return YES when the restoration matches the saved physical display set.
  */
-static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID) {
+static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID, CGConfigureOption option) {
   CGDisplayConfigRef config = NULL;
-  CGError error = SLSBeginDisplayConfiguration(&config);
+  CGError error = CGBeginDisplayConfiguration(&config);
   if (error != kCGErrorSuccess || !config) {
     fprintf(stderr, "[vd_helper] Could not begin display restoration: %d\n", error);
     return NO;
@@ -348,19 +350,9 @@ static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID) {
     }
   }
 
-  if (virtualID != 0 && CGDisplayIsOnline(virtualID)) {
-    error = SLSConfigureDisplayEnabled(config, virtualID, false);
-    if (error != kCGErrorSuccess) {
-      fprintf(stderr, "[vd_helper] Could not disable virtual display %u: %d\n", virtualID, error);
-      CGCancelDisplayConfiguration(config);
-      return NO;
-    }
-  }
-
-  error = SLSCompleteDisplayConfiguration(config, kCGConfigureForAppOnly, 0);
+  error = CGCompleteDisplayConfiguration(config, option);
   if (error != kCGErrorSuccess) {
     fprintf(stderr, "[vd_helper] Could not complete display restoration: %d\n", error);
-    CGCancelDisplayConfiguration(config);
     return NO;
   }
   if (!waitForOriginalDisplays(virtualID)) {
@@ -368,6 +360,22 @@ static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID) {
     return NO;
   }
   return YES;
+}
+
+/**
+ * @brief Retry session-scoped physical recovery after a holder failure.
+ * @param virtualID Last virtual display identifier reported by the holder.
+ * @return YES when the saved physical display set was restored.
+ */
+static BOOL recoverOriginalDisplays(CGDirectDisplayID virtualID) {
+  static const unsigned int attempts = 3;
+  for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
+    if (restoreOriginalDisplays(virtualID, kCGConfigureForSession)) {
+      return YES;
+    }
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
+  }
+  return NO;
 }
 
 /**
@@ -382,13 +390,13 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   }
 
   CGDisplayConfigRef config = NULL;
-  CGError error = SLSBeginDisplayConfiguration(&config);
+  CGError error = CGBeginDisplayConfiguration(&config);
   if (error != kCGErrorSuccess || !config) {
     fprintf(stderr, "[vd_helper] Could not begin exclusive display configuration: %d\n", error);
     return NO;
   }
 
-  error = SLSConfigureDisplayEnabled(config, virtualID, true);
+  error = kCGErrorSuccess;
   for (uint32_t i = 0; error == kCGErrorSuccess && i < originalOnlineDisplayCount; ++i) {
     if (originalOnlineDisplayIDs[i] == virtualID) {
       continue;
@@ -402,13 +410,10 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
     return NO;
   }
 
-  error = SLSCompleteDisplayConfiguration(config, kCGConfigureForAppOnly, 0);
+  error = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
   if (error != kCGErrorSuccess || !waitForDisplayReady(virtualID) || !onlyVirtualDisplayActive(virtualID)) {
     fprintf(stderr, "[vd_helper] Exclusive configuration did not leave only virtual display active\n");
-    if (error != kCGErrorSuccess) {
-      CGCancelDisplayConfiguration(config);
-    }
-    if (!restoreOriginalDisplays(virtualID)) {
+    if (!restoreOriginalDisplays(virtualID, kCGConfigureForAppOnly)) {
       fprintf(stderr, "[vd_helper] Display restoration after exclusive failure also failed\n");
     }
     return NO;
@@ -419,25 +424,22 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
 }
 
 /**
- * @brief Enable the virtual display and place it beside the main display.
+ * @brief Place the virtual display beside the main display.
  * @param virtualID Virtual display identifier.
- * @param exclusive Whether the configuration should remain app-local.
+ * @param exclusive Whether completion should remain app-local instead of session-wide.
  * @return YES when WindowServer accepted the configuration.
  */
 static BOOL activateVirtualDisplay(CGDirectDisplayID virtualID, BOOL exclusive) {
   CGDisplayConfigRef config = NULL;
-  CGError error = SLSBeginDisplayConfiguration(&config);
+  CGError error = CGBeginDisplayConfiguration(&config);
   if (error != kCGErrorSuccess || !config) {
     fprintf(stderr, "[vd_helper] Could not begin virtual display configuration: %d\n", error);
     return NO;
   }
 
-  error = SLSConfigureDisplayEnabled(config, virtualID, true);
-  if (error == kCGErrorSuccess) {
-    const CGDirectDisplayID mainDisplay = CGMainDisplayID();
-    const int32_t mainWidth = (int32_t) CGDisplayPixelsWide(mainDisplay);
-    error = SLSConfigureDisplayOrigin(config, virtualID, mainWidth, 0);
-  }
+  const CGDirectDisplayID mainDisplay = CGMainDisplayID();
+  const int32_t mainWidth = (int32_t) CGDisplayPixelsWide(mainDisplay);
+  error = CGConfigureDisplayOrigin(config, virtualID, mainWidth, 0);
   if (error != kCGErrorSuccess) {
     fprintf(stderr, "[vd_helper] Could not prepare virtual display %u: %d\n", virtualID, error);
     CGCancelDisplayConfiguration(config);
@@ -445,10 +447,9 @@ static BOOL activateVirtualDisplay(CGDirectDisplayID virtualID, BOOL exclusive) 
   }
 
   const CGConfigureOption option = exclusive ? kCGConfigureForAppOnly : kCGConfigureForSession;
-  error = SLSCompleteDisplayConfiguration(config, option, 0);
+  error = CGCompleteDisplayConfiguration(config, option);
   if (error != kCGErrorSuccess) {
     fprintf(stderr, "[vd_helper] Could not activate virtual display %u: %d\n", virtualID, error);
-    CGCancelDisplayConfiguration(config);
     return NO;
   }
   return YES;
@@ -526,16 +527,46 @@ static void forceExtendMode(CGDirectDisplayID virtualID) {
 }
 
 /**
- * @brief Create and hold a virtual display until shutdown is requested.
+ * @brief Parse and validate the display request shared by guardian and holder.
+ * @param argc Argument count in the public helper layout.
+ * @param argv Executable name followed by width, height, refresh rate, and optional mode.
+ * @param width Receives the requested width.
+ * @param height Receives the requested height.
+ * @param fps Receives the requested refresh rate.
+ * @param exclusive Receives whether exclusive mode was requested.
+ * @return YES when every argument is valid.
+ */
+static BOOL parseDisplayArguments(int argc, const char *argv[], int *width, int *height, int *fps, BOOL *exclusive) {
+  if (argc != 4 && argc != 5) {
+    return NO;
+  }
+
+  *exclusive = NO;
+  if (argc == 5) {
+    if (strcmp(argv[4], "exclusive") == 0) {
+      *exclusive = YES;
+    } else if (strcmp(argv[4], "extend") != 0) {
+      return NO;
+    }
+  }
+
+  *width = atoi(argv[1]);
+  *height = atoi(argv[2]);
+  *fps = atoi(argv[3]);
+  return *width > 0 && *height > 0 && *fps > 0;
+}
+
+/**
+ * @brief Create and hold a virtual display until its guardian requests shutdown.
  * @param argc Argument count.
  * @param argv Width, height, refresh rate, and optional display mode.
  * @return Zero after orderly cleanup, otherwise a startup error code.
  */
-int main(int argc, const char *argv[]) {
+static int runDisplayHolder(int argc, const char *argv[]) {
   @autoreleasepool {
-    // vd_helper owns the CGVirtualDisplay object. If Sunshine exits without
-    // calling virtual_display_destroy(), launchd reparents this process and
-    // the display would otherwise remain registered indefinitely.
+    // The holder owns the CGVirtualDisplay object. If its guardian exits,
+    // launchd reparents this process and the display would otherwise remain
+    // registered indefinitely.
     originalParentPID = getppid();
 
     if (!parentIsAlive()) {
@@ -545,29 +576,12 @@ int main(int argc, const char *argv[]) {
       return 1;
     }
 
-    if (argc != 4 && argc != 5) {
-      fprintf(stdout, "0\n");
-      fflush(stdout);
-      return 1;
-    }
-
+    int width = 0;
+    int height = 0;
+    int fps = 0;
     BOOL exclusiveMode = NO;
-    if (argc == 5) {
-      if (strcmp(argv[4], "exclusive") == 0) {
-        exclusiveMode = YES;
-      } else if (strcmp(argv[4], "extend") != 0) {
-        fprintf(stderr, "[vd_helper] Unknown display mode: %s\n", argv[4]);
-        fprintf(stdout, "0\n");
-        fflush(stdout);
-        return 1;
-      }
-    }
-
-    int width = atoi(argv[1]);
-    int height = atoi(argv[2]);
-    int fps = atoi(argv[3]);
-
-    if (width <= 0 || height <= 0 || fps <= 0) {
+    if (!parseDisplayArguments(argc, argv, &width, &height, &fps, &exclusiveMode)) {
+      fprintf(stderr, "[vd_helper] Invalid holder arguments\n");
       fprintf(stdout, "0\n");
       fflush(stdout);
       return 1;
@@ -693,7 +707,7 @@ int main(int argc, const char *argv[]) {
     if (!parentIsAlive() || shouldExit || !activateVirtualDisplay(resultID, exclusiveMode)) {
       fprintf(stderr, "[vd_helper] Virtual display activation failed\n");
       if (exclusiveMode) {
-        restoreOriginalDisplays(resultID);
+        restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -708,7 +722,7 @@ int main(int argc, const char *argv[]) {
     if (!parentIsAlive() || shouldExit) {
       fprintf(stderr, "[vd_helper] Parent exited while activating virtual display\n");
       if (exclusiveMode) {
-        restoreOriginalDisplays(resultID);
+        restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -776,7 +790,7 @@ int main(int argc, const char *argv[]) {
     if (!waitForDisplayReady(resultID)) {
       fprintf(stderr, "[vd_helper] Display %u did not become online and active\n", resultID);
       if (exclusiveMode) {
-        restoreOriginalDisplays(resultID);
+        restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -787,7 +801,7 @@ int main(int argc, const char *argv[]) {
 
     if (exclusiveMode && !applyExclusiveMode(resultID)) {
       fprintf(stderr, "[vd_helper] Could not enter exclusive display mode\n");
-      restoreOriginalDisplays(resultID);
+      restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       keepAlive = nil;
       keepDesc = nil;
       fprintf(stdout, "0\n");
@@ -798,7 +812,7 @@ int main(int argc, const char *argv[]) {
     if (!parentIsAlive() || shouldExit) {
       fprintf(stderr, "[vd_helper] Parent exited before virtual display became ready\n");
       if (exclusiveMode) {
-        restoreOriginalDisplays(resultID);
+        restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -832,7 +846,7 @@ int main(int argc, const char *argv[]) {
       CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
     }
 
-    if (exclusiveApplied && !restoreOriginalDisplays(resultID)) {
+    if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
       fprintf(stderr, "[vd_helper] Display restoration during shutdown failed\n");
     }
     fprintf(stderr, "[vd_helper] Shutting down, releasing display %u\n", resultID);
@@ -840,4 +854,233 @@ int main(int argc, const char *argv[]) {
     keepDesc = nil;
   }
   return 0;
+}
+
+/** @brief Result of waiting for the holder's startup protocol. */
+typedef enum {
+  VD_HOLDER_START_READY,
+  VD_HOLDER_START_EXITED,
+  VD_HOLDER_START_ABORTED,
+  VD_HOLDER_START_ERROR,
+} vd_holder_start_result_t;
+
+/**
+ * @brief Read and validate the holder's single display-ID line.
+ * @param descriptor Read end of the holder stdout pipe.
+ * @param holderPID Holder process identifier.
+ * @param displayID Receives the parsed display identifier, including zero on holder failure.
+ * @param holderStatus Receives the holder wait status if it exits during startup.
+ * @return Startup protocol result.
+ */
+static vd_holder_start_result_t readHolderDisplayID(int descriptor, pid_t holderPID, uint32_t *displayID, int *holderStatus) {
+  static const unsigned int attempts = 90;
+  static const suseconds_t interval = 100000;
+  char buffer[64] = {0};
+  size_t used = 0;
+
+  for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
+    if (shouldExit || !parentIsAlive()) {
+      return VD_HOLDER_START_ABORTED;
+    }
+
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(descriptor, &readSet);
+    struct timeval timeout = {0, interval};
+    const int selected = select(descriptor + 1, &readSet, NULL, NULL, &timeout);
+    if (selected > 0) {
+      const ssize_t bytesRead = read(descriptor, buffer + used, sizeof(buffer) - used - 1);
+      if (bytesRead < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return VD_HOLDER_START_ERROR;
+      }
+      if (bytesRead == 0) {
+        const int state = vd_reap_child_if_exited(holderPID, holderStatus);
+        return state == 1 ? VD_HOLDER_START_EXITED : VD_HOLDER_START_ERROR;
+      }
+      used += (size_t) bytesRead;
+      buffer[used] = '\0';
+
+      char *newline = memchr(buffer, '\n', used);
+      if (newline) {
+        *newline = '\0';
+        char *end = NULL;
+        errno = 0;
+        const unsigned long parsed = strtoul(buffer, &end, 10);
+        if (errno != 0 || end == buffer || end != newline || parsed > UINT32_MAX) {
+          return VD_HOLDER_START_ERROR;
+        }
+        *displayID = (uint32_t) parsed;
+        return VD_HOLDER_START_READY;
+      }
+      if (used == sizeof(buffer) - 1) {
+        return VD_HOLDER_START_ERROR;
+      }
+    } else if (selected < 0 && errno != EINTR) {
+      return VD_HOLDER_START_ERROR;
+    }
+
+    const int state = vd_reap_child_if_exited(holderPID, holderStatus);
+    if (state == 1) {
+      return VD_HOLDER_START_EXITED;
+    }
+    if (state < 0) {
+      return VD_HOLDER_START_ERROR;
+    }
+  }
+  return VD_HOLDER_START_ERROR;
+}
+
+/**
+ * @brief Write the guardian's one-line startup result for Sunshine.
+ * @param displayID Display identifier, or zero on failure.
+ */
+static void writeGuardianDisplayID(uint32_t displayID) {
+  fprintf(stdout, "%u\n", displayID);
+  fflush(stdout);
+}
+
+/**
+ * @brief Supervise a separately spawned virtual-display holder.
+ *
+ * The guardian keeps an independent physical-display snapshot so it can
+ * recover the desktop even if the holder is killed before its cleanup runs.
+ *
+ * @param argc Public helper argument count.
+ * @param argv Public helper arguments.
+ * @return Zero after an orderly shutdown, otherwise a startup or recovery error.
+ */
+static int runDisplayGuardian(int argc, const char *argv[]) {
+  originalParentPID = getppid();
+  if (!parentIsAlive()) {
+    fprintf(stderr, "[vd_helper] Guardian has no live Sunshine parent process\n");
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+
+  int width = 0;
+  int height = 0;
+  int fps = 0;
+  BOOL exclusiveMode = NO;
+  if (!parseDisplayArguments(argc, argv, &width, &height, &fps, &exclusiveMode)) {
+    fprintf(stderr, "[vd_helper] Invalid guardian arguments\n");
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+
+  char widthString[16];
+  char heightString[16];
+  char fpsString[16];
+  snprintf(widthString, sizeof(widthString), "%d", width);
+  snprintf(heightString, sizeof(heightString), "%d", height);
+  snprintf(fpsString, sizeof(fpsString), "%d", fps);
+  if (!installSignalHandlers()) {
+    fprintf(stderr, "[vd_helper] Guardian could not install signal handlers: %s\n", strerror(errno));
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+  if (exclusiveMode && !captureOriginalDisplays()) {
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+
+  int pipefd[2];
+  const int pipeError = vd_make_pipe(pipefd);
+  if (pipeError != 0) {
+    fprintf(stderr, "[vd_helper] Guardian could not create holder pipe: %s\n", strerror(pipeError));
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+
+  const char *mode = exclusiveMode ? "exclusive" : "extend";
+  const char *holderArguments[] = {
+    argv[0],
+    "--holder",
+    widthString,
+    heightString,
+    fpsString,
+    mode,
+    NULL,
+  };
+  pid_t holderPID = 0;
+  const int spawnError = vd_spawn_with_cloexec(&holderPID, argv[0], pipefd[1], pipefd[0], false, (char *const *) holderArguments, environ);
+  close(pipefd[1]);
+  if (spawnError != 0) {
+    close(pipefd[0]);
+    fprintf(stderr, "[vd_helper] Guardian could not spawn display holder: %s\n", strerror(spawnError));
+    writeGuardianDisplayID(0);
+    return 1;
+  }
+  fprintf(stderr, "[vd_helper] Guardian spawned display holder pid=%d\n", holderPID);
+
+  uint32_t displayID = 0;
+  int holderStatus = 0;
+  const vd_holder_start_result_t startup = readHolderDisplayID(pipefd[0], holderPID, &displayID, &holderStatus);
+  close(pipefd[0]);
+  BOOL holderReaped = startup == VD_HOLDER_START_EXITED;
+
+  if (startup != VD_HOLDER_START_READY || displayID == 0) {
+    if (!holderReaped && !vd_terminate_and_reap(holderPID, 40, 20, 100000, &holderStatus)) {
+      fprintf(stderr, "[vd_helper] Guardian could not reap failed holder pid=%d\n", holderPID);
+    }
+    if (exclusiveMode && !recoverOriginalDisplays(displayID)) {
+      fprintf(stderr, "[vd_helper] Guardian recovery after holder startup failure failed\n");
+    }
+    if (!shouldExit && parentIsAlive()) {
+      writeGuardianDisplayID(0);
+    }
+    return 1;
+  }
+
+  writeGuardianDisplayID(displayID);
+  fprintf(stderr, "[vd_helper] Guardian relayed display %u from holder pid=%d\n", displayID, holderPID);
+
+  BOOL holderExitedUnexpectedly = NO;
+  while (!shouldExit && parentIsAlive()) {
+    const int state = vd_reap_child_if_exited(holderPID, &holderStatus);
+    if (state == 1) {
+      holderReaped = YES;
+      holderExitedUnexpectedly = YES;
+      fprintf(stderr, "[vd_helper] Display holder pid=%d exited unexpectedly\n", holderPID);
+      break;
+    }
+    if (state < 0) {
+      holderExitedUnexpectedly = YES;
+      fprintf(stderr, "[vd_helper] Could not inspect display holder pid=%d: %s\n", holderPID, strerror(errno));
+      break;
+    }
+    usleep(100000);
+  }
+
+  if (!holderReaped && !vd_terminate_and_reap(holderPID, 30, 20, 100000, &holderStatus)) {
+    fprintf(stderr, "[vd_helper] Guardian could not stop and reap holder pid=%d\n", holderPID);
+    holderExitedUnexpectedly = YES;
+  }
+
+  BOOL restored = YES;
+  if (exclusiveMode) {
+    restored = recoverOriginalDisplays(displayID);
+    if (!restored) {
+      fprintf(stderr, "[vd_helper] Guardian could not restore the saved physical displays\n");
+    }
+  }
+
+  return holderExitedUnexpectedly || !restored ? 1 : 0;
+}
+
+/**
+ * @brief Select guardian or hidden holder mode.
+ * @param argc Argument count.
+ * @param argv Helper arguments.
+ * @return Process exit status.
+ */
+int main(int argc, const char *argv[]) {
+  @autoreleasepool {
+    if (argc > 1 && strcmp(argv[1], "--holder") == 0) {
+      return runDisplayHolder(argc - 1, argv + 1);
+    }
+    return runDisplayGuardian(argc, argv);
+  }
 }

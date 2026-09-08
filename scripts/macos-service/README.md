@@ -4,6 +4,15 @@ These assets keep the selected Sunshine or Lumen runtime attached to the
 logged-in Aqua session while making launchd restart it after either a crash or
 a clean process exit.
 
+The `CGVirtualDisplay` lifecycle is held by a separate helper. Private hardware
+enablement targets physical displays only. Normal shutdown restores them before
+releasing the virtual display, and a surviving supervisor attempts restoration
+after a holder crash. App-only configuration does not restore hardware
+automatically after a crash. The supervisor uses a separate process group to
+survive launchd cleanup of a crashed server. Validate each single-process
+failure on the target Mac before activation; simultaneous supervisor and holder
+failure remains untested.
+
 The launcher remains at the existing app-bundle path so the current
 `com.clayne.lumen` job and macOS privacy identity continue to refer to the same
 bundle. It waits for an existing TCP 47990 listener to disappear before
@@ -61,7 +70,8 @@ The plist keeps `RunAtLoad`, `LimitLoadToSessionType=Aqua`, and the existing
 stdout/stderr log locations. `KeepAlive=true` is deliberate: launchd should
 bring the selected runtime back after a nonzero or zero exit.
 `ThrottleInterval=15` prevents a rapid crash loop from consuming the login
-session.
+session. `ExitTimeOut=20` gives a bounded graceful-shutdown window for the
+runtime and helper to restore physical displays before launchd sends SIGKILL.
 
 Read-only checks after activation:
 

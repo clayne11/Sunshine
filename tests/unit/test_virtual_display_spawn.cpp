@@ -56,7 +56,7 @@ TEST(VirtualDisplaySpawn, ClosesUnlistedPipeAndSocketDescriptors) {
   const char *child_argv[] = {"sh", "-c", script, "sh", pipe_fd, socket_fd, nullptr};
 
   pid_t child = 0;
-  const int spawn_error = vd_spawn_with_cloexec(&child, "/bin/sh", output_pipe[1], output_pipe[0], const_cast<char *const *>(child_argv), environ);
+  const int spawn_error = vd_spawn_with_cloexec(&child, "/bin/sh", output_pipe[1], output_pipe[0], false, const_cast<char *const *>(child_argv), environ);
 
   close(output_pipe[1]);
   close(inherited_pipe[0]);
@@ -74,6 +74,96 @@ TEST(VirtualDisplaySpawn, ClosesUnlistedPipeAndSocketDescriptors) {
   ASSERT_EQ(WEXITSTATUS(child_status), 0) << std::string(output, bytes_read > 0 ? static_cast<size_t>(bytes_read) : 0);
   ASSERT_GT(bytes_read, 0);
   EXPECT_EQ(std::string(output, static_cast<size_t>(bytes_read)), "passed");
+}
+
+TEST(VirtualDisplaySpawn, RejectsInvalidProcessIdentifiers) {
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(vd_reap_child_if_exited(0, &status), -1);
+  EXPECT_EQ(errno, EINVAL);
+
+  errno = 0;
+  EXPECT_FALSE(vd_terminate_and_reap(-1, 1, 1, 1000, &status));
+  EXPECT_EQ(errno, EINVAL);
+}
+
+TEST(VirtualDisplaySpawn, CreatesIsolatedProcessGroupWhenRequested) {
+  int output_pipe[2];
+  ASSERT_EQ(vd_make_pipe(output_pipe), 0) << std::strerror(errno);
+  const char *child_argv[] = {"sleep", "5", nullptr};
+
+  pid_t child = 0;
+  const int spawn_error = vd_spawn_with_cloexec(&child, "/bin/sleep", output_pipe[1], output_pipe[0], true, const_cast<char *const *>(child_argv), environ);
+  close(output_pipe[0]);
+  close(output_pipe[1]);
+
+  ASSERT_EQ(spawn_error, 0) << std::strerror(spawn_error);
+  EXPECT_EQ(getpgid(child), child);
+  EXPECT_NE(getpgrp(), child);
+
+  int status = 0;
+  EXPECT_TRUE(vd_terminate_and_reap(child, 20, 20, 10000, &status));
+}
+
+TEST(VirtualDisplaySpawn, DetectsAndReapsCrashedChild) {
+  const pid_t child = fork();
+  ASSERT_GE(child, 0) << std::strerror(errno);
+  if (child == 0) {
+    raise(SIGKILL);
+    _exit(1);
+  }
+
+  int status = 0;
+  int state = 0;
+  for (unsigned int attempt = 0; attempt < 100 && state == 0; ++attempt) {
+    state = vd_reap_child_if_exited(child, &status);
+    if (state == 0) {
+      usleep(10000);
+    }
+  }
+
+  ASSERT_EQ(state, 1);
+  ASSERT_TRUE(WIFSIGNALED(status));
+  EXPECT_EQ(WTERMSIG(status), SIGKILL);
+  EXPECT_EQ(waitpid(child, &status, WNOHANG), -1);
+  EXPECT_EQ(errno, ECHILD);
+}
+
+TEST(VirtualDisplaySpawn, ForcesAndReapsChildAfterGracePeriod) {
+  int ready_pipe[2];
+  ASSERT_EQ(vd_make_pipe(ready_pipe), 0) << std::strerror(errno);
+
+  const pid_t child = fork();
+  ASSERT_GE(child, 0) << std::strerror(errno);
+  if (child == 0) {
+    close(ready_pipe[0]);
+    struct sigaction action = {};
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, nullptr) != 0) {
+      _exit(1);
+    }
+    const char ready = '1';
+    if (write(ready_pipe[1], &ready, sizeof(ready)) != sizeof(ready)) {
+      _exit(1);
+    }
+    close(ready_pipe[1]);
+    for (;;) {
+      pause();
+    }
+  }
+
+  close(ready_pipe[1]);
+  char ready = 0;
+  ASSERT_EQ(read(ready_pipe[0], &ready, sizeof(ready)), static_cast<ssize_t>(sizeof(ready)));
+  close(ready_pipe[0]);
+
+  int status = 0;
+  ASSERT_TRUE(vd_terminate_and_reap(child, 2, 100, 10000, &status));
+  ASSERT_TRUE(WIFSIGNALED(status));
+  EXPECT_EQ(WTERMSIG(status), SIGKILL);
+  EXPECT_EQ(waitpid(child, &status, WNOHANG), -1);
+  EXPECT_EQ(errno, ECHILD);
 }
 
 TEST(VirtualDisplaySpawn, DetectsParentExitWithGetppid) {
@@ -165,6 +255,22 @@ TEST(VirtualDisplaySpawn, ClosesUnlistedPipeAndSocketDescriptors) {
 
 TEST(VirtualDisplaySpawn, DetectsParentExitWithGetppid) {
   GTEST_SKIP() << "vd_helper parent watchdog is macOS-specific";
+}
+
+TEST(VirtualDisplaySpawn, RejectsInvalidProcessIdentifiers) {
+  GTEST_SKIP() << "vd_helper process supervision is macOS-specific";
+}
+
+TEST(VirtualDisplaySpawn, CreatesIsolatedProcessGroupWhenRequested) {
+  GTEST_SKIP() << "vd_helper process supervision is macOS-specific";
+}
+
+TEST(VirtualDisplaySpawn, DetectsAndReapsCrashedChild) {
+  GTEST_SKIP() << "vd_helper process supervision is macOS-specific";
+}
+
+TEST(VirtualDisplaySpawn, ForcesAndReapsChildAfterGracePeriod) {
+  GTEST_SKIP() << "vd_helper process supervision is macOS-specific";
 }
 
 #endif

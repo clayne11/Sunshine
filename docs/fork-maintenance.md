@@ -18,9 +18,17 @@ Retained capabilities:
   temporary display configuration owned by the helper.
 - Target input at the current captured display, including its current logical
   bounds, instead of caching the physical display's scale or dimensions.
-- Clean up on disconnect, unsuccessful launch, timeout, helper exit, and server
-  termination. Helper spawning closes unrelated file descriptors so it cannot
-  retain the server's listening sockets.
+- Keep the `CGVirtualDisplay` lifecycle in a dedicated helper. Private hardware
+  enablement targets physical displays only. Normal shutdown restores them
+  before releasing the virtual display; a surviving supervisor also restores
+  them after a holder crash. App-only scope does not provide automatic crash
+  restoration. Helper spawning
+  closes unrelated file descriptors so it cannot retain the server's listening
+  sockets.
+- Use the supervisor/holder pair to recover when either process dies alone.
+  The supervisor has its own process group so launchd can restart Sunshine
+  without killing display recovery. Recovery after both helper processes die
+  together is not a tested guarantee.
 - Stage and install a login-session service with restart supervision and rollback.
 
 Current Sunshine already supplies the audio, encoding, packaging, and general
@@ -79,8 +87,10 @@ switching the installed service, record successful checks for:
 3. Repeated disconnect, reconnect, resume, and changed client resolution.
 4. Exclusive mode exposing only the virtual display while connected, followed
    by restoration of the original physical display arrangement on disconnect.
-5. Restoration after helper and server failure, without orphaned helpers or
-   listening sockets; an abandoned launch must also clean up.
+5. Explicit restoration after helper or server failure, without orphaned
+   helpers or listening sockets; verify supervisor/holder recovery when either
+   process dies alone. Treat simultaneous failure as untested until it is
+   exercised.
 6. Service restart after clean exit and crash, and startup in the user's next
    graphical login session.
 7. A tested rollback to the retained runtime and configuration.
