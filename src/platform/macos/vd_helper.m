@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/** @brief Process environment passed to the holder subprocess. */
 extern char **environ;
 
 /** @brief A mode exposed by the private CGVirtualDisplay API. */
@@ -858,10 +859,10 @@ static int runDisplayHolder(int argc, const char *argv[]) {
 
 /** @brief Result of waiting for the holder's startup protocol. */
 typedef enum {
-  VD_HOLDER_START_READY,
-  VD_HOLDER_START_EXITED,
-  VD_HOLDER_START_ABORTED,
-  VD_HOLDER_START_ERROR,
+  VD_HOLDER_START_READY,  ///< Holder reported a syntactically valid display ID.
+  VD_HOLDER_START_EXITED,  ///< Holder exited and was reaped before reporting readiness.
+  VD_HOLDER_START_ABORTED,  ///< Guardian shutdown began before holder readiness.
+  VD_HOLDER_START_ERROR,  ///< Startup protocol or process inspection failed.
 } vd_holder_start_result_t;
 
 /**
