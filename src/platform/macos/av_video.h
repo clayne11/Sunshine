@@ -66,6 +66,8 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 
 /**
  * @brief Initialize AVFoundation capture for a display and frame rate.
+ * @details Falls back to the display's reported pixel dimensions when an
+ * externally owned virtual display does not expose a current display mode.
  *
  * @param displayID Display ID.
  * @param frameRate Frame rate.

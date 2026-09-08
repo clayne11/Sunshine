@@ -11,24 +11,34 @@
   self = [super init];
 
   CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displayID);
-  if (!mode) {
-    [self release];
-    return nil;
-  }
 
   self.displayID = displayID;
   self.pixelFormat = kCVPixelFormatType_32BGRA;
-  self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
-  self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
+  if (mode) {
+    self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
+    self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
+    CFRelease(mode);
+  } else {
+    // CGVirtualDisplay can be online, active, and capturable without exposing a
+    // current CGDisplayMode to the process that did not create it.
+    self.frameWidth = (int) CGDisplayPixelsWide(displayID);
+    self.frameHeight = (int) CGDisplayPixelsHigh(displayID);
+  }
+  if (self.frameWidth <= 0 || self.frameHeight <= 0) {
+    [self release];
+    return nil;
+  }
   self.minFrameDuration = CMTimeMake(1, frameRate);
   self.session = [[AVCaptureSession alloc] init];
   self.videoOutputs = [[NSMapTable alloc] init];
   self.captureCallbacks = [[NSMapTable alloc] init];
   self.captureSignals = [[NSMapTable alloc] init];
 
-  CFRelease(mode);
-
   AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
+  if (!screenInput) {
+    [self release];
+    return nil;
+  }
   [screenInput setMinFrameDuration:self.minFrameDuration];
 
   if ([self.session canAddInput:screenInput]) {
