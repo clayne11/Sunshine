@@ -14,6 +14,7 @@
  *   3. In exclusive mode, SLSConfigureDisplayEnabled disables the saved physical displays
  * Compiled with ARC (-fobjc-arc).
  */
+#include "display_preferences.h"
 #include "vd_spawn.h"
 
 #import <AppKit/AppKit.h>
@@ -126,6 +127,18 @@ static uint32_t originalDisplayCount = 0;  ///< Number of saved display IDs.
 static CGDirectDisplayID originalOnlineDisplayIDs[64];  ///< All physical displays online before creation.
 static uint32_t originalOnlineDisplayCount = 0;  ///< Number of saved online display IDs.
 static BOOL exclusiveApplied = NO;  ///< Whether physical displays were disabled.
+
+/**
+ * @brief Parsed request shared by the guardian and holder processes.
+ */
+typedef struct display_request_t {
+  macos_display_requested_mode_t requested;  ///< Moonlight tuple that initiated the request.
+  macos_display_mode_t effective;  ///< Logical/backing mode to offer and select.
+  uint32_t helper_serial;  ///< Stable serial for this paired client, or zero for legacy callers.
+  const char *profile_directory;  ///< Profile directory for the holder's mode snapshot.
+  const char *certificate_fingerprint;  ///< Paired client certificate fingerprint, or an empty string.
+  BOOL exclusive;  ///< Whether physical displays are temporarily disabled.
+} display_request_t;
 
 /**
  * @brief Request orderly helper shutdown from an async signal context.
@@ -537,33 +550,329 @@ static void forceExtendMode(CGDirectDisplayID virtualID) {
 }
 
 /**
- * @brief Parse and validate the display request shared by guardian and holder.
- * @param argc Argument count in the public helper layout.
- * @param argv Executable name followed by width, height, refresh rate, and optional mode.
- * @param width Receives the requested width.
- * @param height Receives the requested height.
- * @param fps Receives the requested refresh rate.
- * @param exclusive Receives whether exclusive mode was requested.
- * @return YES when every argument is valid.
+ * @brief Parse a bounded unsigned integer from helper arguments.
+ * @param value Argument text.
+ * @param output Receives the parsed value.
+ * @return YES when the complete argument is a positive unsigned integer.
  */
-static BOOL parseDisplayArguments(int argc, const char *argv[], int *width, int *height, int *fps, BOOL *exclusive) {
-  if (argc != 4 && argc != 5) {
+static BOOL parseUnsignedArgument(const char *value, uint32_t *output) {
+  if (!value || !output || *value == '\0') {
     return NO;
   }
 
-  *exclusive = NO;
+  char *end = NULL;
+  errno = 0;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+    return NO;
+  }
+  *output = (uint32_t) parsed;
+  return YES;
+}
+
+/**
+ * @brief Parse a non-negative unsigned integer from helper arguments.
+ * @param value Argument text.
+ * @param output Receives the parsed value.
+ * @return YES when the complete argument is an unsigned integer.
+ */
+static BOOL parseUnsignedArgumentAllowZero(const char *value, uint32_t *output) {
+  if (!value || !output || *value == '\0') {
+    return NO;
+  }
+
+  char *end = NULL;
+  errno = 0;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX) {
+    return NO;
+  }
+  *output = (uint32_t) parsed;
+  return YES;
+}
+
+/**
+ * @brief Parse a bounded refresh rate from helper arguments.
+ * @param value Argument text.
+ * @param output Receives the parsed rate.
+ * @return YES when the complete argument is a finite positive refresh rate.
+ */
+static BOOL parseRefreshArgument(const char *value, double *output) {
+  if (!value || !output || *value == '\0') {
+    return NO;
+  }
+
+  char *end = NULL;
+  errno = 0;
+  const double parsed = strtod(value, &end);
+  if (errno != 0 || end == value || *end != '\0' || !isfinite(parsed) || parsed <= 0.0 || parsed > MACOS_DISPLAY_PREFERENCE_MAX_REFRESH_RATE) {
+    return NO;
+  }
+  *output = parsed;
+  return YES;
+}
+
+/**
+ * @brief Parse and validate the display request shared by guardian and holder.
+ * @param argc Argument count in the public helper layout.
+ * @param argv Executable name followed by request fields and optional mode.
+ * @param request Receives the parsed request.
+ * @return YES when every argument is valid.
+ *
+ * The four-argument form remains available for direct helper diagnostics. The
+ * extended form carries the requested tuple, effective logical/backing mode,
+ * stable serial, and the holder's profile context.
+ */
+static BOOL parseDisplayArguments(int argc, const char *argv[], display_request_t *request) {
+  if (!request || (argc != 4 && argc != 5 && argc != 14)) {
+    return NO;
+  }
+  memset(request, 0, sizeof(*request));
+
+  const char *mode = "extend";
   if (argc == 5) {
-    if (strcmp(argv[4], "exclusive") == 0) {
-      *exclusive = YES;
-    } else if (strcmp(argv[4], "extend") != 0) {
-      return NO;
+    mode = argv[4];
+  } else if (argc == 14) {
+    mode = argv[13];
+  }
+  if (strcmp(mode, "exclusive") == 0) {
+    request->exclusive = YES;
+  } else if (strcmp(mode, "extend") != 0) {
+    return NO;
+  }
+
+  if (!parseUnsignedArgument(argv[1], &request->requested.width) || !parseUnsignedArgument(argv[2], &request->requested.height) || !parseUnsignedArgument(argv[3], &request->requested.refresh_rate) || request->requested.width > MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION || request->requested.height > MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION || request->requested.refresh_rate > MACOS_DISPLAY_PREFERENCE_MAX_REFRESH_RATE) {
+    return NO;
+  }
+
+  if (argc == 4 || argc == 5) {
+    request->effective.logical_width = request->requested.width;
+    request->effective.logical_height = request->requested.height;
+    request->effective.pixel_width = request->requested.width;
+    request->effective.pixel_height = request->requested.height;
+    request->effective.refresh_rate = (double) request->requested.refresh_rate;
+    request->effective.hidpi = NO;
+    request->profile_directory = "";
+    request->certificate_fingerprint = "";
+    return YES;
+  }
+
+  if (!parseUnsignedArgument(argv[4], &request->effective.logical_width) || !parseUnsignedArgument(argv[5], &request->effective.logical_height) || !parseUnsignedArgument(argv[6], &request->effective.pixel_width) || !parseUnsignedArgument(argv[7], &request->effective.pixel_height) || !parseRefreshArgument(argv[8], &request->effective.refresh_rate) || (strcmp(argv[9], "0") != 0 && strcmp(argv[9], "1") != 0) || !parseUnsignedArgumentAllowZero(argv[10], &request->helper_serial) || request->effective.logical_width > MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION || request->effective.logical_height > MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION || request->effective.pixel_width > MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION || request->effective.pixel_height > MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION || request->effective.pixel_width < request->effective.logical_width || request->effective.pixel_height < request->effective.logical_height) {
+    return NO;
+  }
+
+  request->effective.hidpi = strcmp(argv[9], "1") == 0;
+  if (request->effective.hidpi != (request->effective.pixel_width != request->effective.logical_width || request->effective.pixel_height != request->effective.logical_height)) {
+    return NO;
+  }
+  request->profile_directory = argv[11];
+  request->certificate_fingerprint = argv[12];
+  return YES;
+}
+
+/**
+ * @brief Check whether a CoreGraphics mode snapshot is complete and bounded.
+ * @param mode Mode snapshot to validate.
+ * @return YES when the snapshot can be persisted.
+ */
+static BOOL validModeSnapshot(const macos_display_mode_t *mode) {
+  if (!mode) {
+    return NO;
+  }
+  const BOOL scaled = mode->pixel_width != mode->logical_width || mode->pixel_height != mode->logical_height;
+  return mode->logical_width > 0 && mode->logical_width <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         mode->logical_height > 0 && mode->logical_height <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         mode->pixel_width > 0 && mode->pixel_width <= MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION &&
+         mode->pixel_height > 0 && mode->pixel_height <= MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION &&
+         mode->pixel_width >= mode->logical_width && mode->pixel_height >= mode->logical_height &&
+         isfinite(mode->refresh_rate) && mode->refresh_rate > 0.0 && mode->refresh_rate <= MACOS_DISPLAY_PREFERENCE_MAX_REFRESH_RATE &&
+         mode->hidpi == scaled;
+}
+
+/**
+ * @brief Read the active mode from the holder's CoreGraphics process.
+ * @param displayID Display identifier to inspect.
+ * @param mode Receives logical, backing, refresh, and HiDPI details.
+ * @return YES when CoreGraphics returned a complete mode.
+ */
+static BOOL readCurrentDisplayMode(CGDirectDisplayID displayID, macos_display_mode_t *mode) {
+  if (!mode || !CGDisplayIsOnline(displayID) || !CGDisplayIsActive(displayID)) {
+    return NO;
+  }
+
+  CGDisplayModeRef current = CGDisplayCopyDisplayMode(displayID);
+  if (!current) {
+    return NO;
+  }
+
+  const size_t logicalWidth = CGDisplayModeGetWidth(current);
+  const size_t logicalHeight = CGDisplayModeGetHeight(current);
+  const size_t pixelWidth = CGDisplayModeGetPixelWidth(current);
+  const size_t pixelHeight = CGDisplayModeGetPixelHeight(current);
+  const double refreshRate = CGDisplayModeGetRefreshRate(current);
+  CFRelease(current);
+  if (logicalWidth > UINT32_MAX || logicalHeight > UINT32_MAX || pixelWidth > UINT32_MAX || pixelHeight > UINT32_MAX) {
+    return NO;
+  }
+
+  *mode = (macos_display_mode_t) {
+    (uint32_t) logicalWidth,
+    (uint32_t) logicalHeight,
+    (uint32_t) pixelWidth,
+    (uint32_t) pixelHeight,
+    refreshRate,
+    pixelWidth != logicalWidth || pixelHeight != logicalHeight
+  };
+  return validModeSnapshot(mode);
+}
+
+/**
+ * @brief Compare two mode snapshots with a small refresh-rate tolerance.
+ * @param lhs First mode.
+ * @param rhs Second mode.
+ * @return YES when dimensions, scale, and refresh rate match.
+ */
+static BOOL sameDisplayMode(const macos_display_mode_t *lhs, const macos_display_mode_t *rhs) {
+  return lhs && rhs && lhs->logical_width == rhs->logical_width && lhs->logical_height == rhs->logical_height &&
+         lhs->pixel_width == rhs->pixel_width && lhs->pixel_height == rhs->pixel_height && lhs->hidpi == rhs->hidpi &&
+         fabs(lhs->refresh_rate - rhs->refresh_rate) <= 0.25;
+}
+
+/**
+ * @brief Add one unique virtual-display mode to a settings list.
+ * @param modes Mutable settings mode list.
+ * @param widths Widths already represented in the list.
+ * @param heights Heights already represented in the list.
+ * @param refreshRates Refresh rates already represented in the list.
+ * @param modeCount Number of populated entries in the parallel arrays.
+ * @param width Mode width.
+ * @param height Mode height.
+ * @param refreshRate Mode refresh rate.
+ * @return YES when the mode already existed or was added successfully.
+ */
+static BOOL appendVirtualDisplayMode(
+  NSMutableArray *modes,
+  unsigned int widths[6],
+  unsigned int heights[6],
+  double refreshRates[6],
+  NSUInteger *modeCount,
+  unsigned int width,
+  unsigned int height,
+  double refreshRate
+) {
+  if (!modes || !modeCount || width == 0 || height == 0) {
+    return NO;
+  }
+  for (NSUInteger index = 0; index < *modeCount; ++index) {
+    if (widths[index] == width && heights[index] == height && fabs(refreshRates[index] - refreshRate) <= 0.01) {
+      return YES;
+    }
+  }
+  if (*modeCount >= 6) {
+    return NO;
+  }
+
+  CGVirtualDisplayMode *mode = [[CGVirtualDisplayMode alloc] initWithWidth:width height:height refreshRate:refreshRate];
+  if (!mode) {
+    return NO;
+  }
+  [modes addObject:mode];
+  widths[*modeCount] = width;
+  heights[*modeCount] = height;
+  refreshRates[*modeCount] = refreshRate;
+  ++*modeCount;
+  return YES;
+}
+
+/**
+ * @brief Select the requested logical/backing mode from the virtual display's mode list.
+ * @param displayID Display identifier to configure.
+ * @param request Effective mode requested by the guardian.
+ * @return YES when an exact or logical-dimension match was applied.
+ */
+static BOOL selectRequestedDisplayMode(CGDirectDisplayID displayID, const display_request_t *request) {
+  if (!request) {
+    return NO;
+  }
+
+  NSDictionary *options = @{(NSString *) kCGDisplayShowDuplicateLowResolutionModes: @YES};
+  CFArrayRef allModes = CGDisplayCopyAllDisplayModes(displayID, (CFDictionaryRef) options);
+  if (!allModes) {
+    return NO;
+  }
+
+  CGDisplayModeRef logicalMatch = NULL;
+  CGDisplayModeRef exactMatch = NULL;
+  const CFIndex modeCount = CFArrayGetCount(allModes);
+  for (CFIndex index = 0; index < modeCount; ++index) {
+    CGDisplayModeRef candidate = (CGDisplayModeRef) CFArrayGetValueAtIndex(allModes, index);
+    if (!candidate) {
+      continue;
+    }
+    const size_t logicalWidth = CGDisplayModeGetWidth(candidate);
+    const size_t logicalHeight = CGDisplayModeGetHeight(candidate);
+    const size_t pixelWidth = CGDisplayModeGetPixelWidth(candidate);
+    const size_t pixelHeight = CGDisplayModeGetPixelHeight(candidate);
+    if (logicalWidth != request->effective.logical_width || logicalHeight != request->effective.logical_height) {
+      continue;
+    }
+    const double refreshRate = CGDisplayModeGetRefreshRate(candidate);
+    if (refreshRate > 0.0 && fabs(refreshRate - request->effective.refresh_rate) > 1.0) {
+      continue;
+    }
+    if (!logicalMatch) {
+      logicalMatch = candidate;
+    }
+    if (pixelWidth == request->effective.pixel_width && pixelHeight == request->effective.pixel_height) {
+      exactMatch = candidate;
+      break;
     }
   }
 
-  *width = atoi(argv[1]);
-  *height = atoi(argv[2]);
-  *fps = atoi(argv[3]);
-  return *width > 0 && *height > 0 && *fps > 0;
+  CGDisplayModeRef selected = exactMatch ? exactMatch : logicalMatch;
+  BOOL success = NO;
+  if (selected) {
+    const CGError error = CGDisplaySetDisplayMode(displayID, selected, NULL);
+    success = error == kCGErrorSuccess;
+    fprintf(stderr, "[vd_helper] Selected %s mode %ux%u logical (%ux%u pixels, %.3fHz): %d\n", exactMatch ? "exact" : "logical fallback", request->effective.logical_width, request->effective.logical_height, request->effective.pixel_width, request->effective.pixel_height, request->effective.refresh_rate, error);
+  } else {
+    fprintf(stderr, "[vd_helper] Requested mode %ux%u logical (%ux%u pixels, %.3fHz) was not found\n", request->effective.logical_width, request->effective.logical_height, request->effective.pixel_width, request->effective.pixel_height, request->effective.refresh_rate);
+  }
+  CFRelease(allModes);
+  return success;
+}
+
+/**
+ * @brief Persist a changed mode while the holder still owns the virtual display.
+ * @param displayID Virtual display identifier to inspect.
+ * @param request Request and profile context for the current client.
+ * @param baseline Mode observed after startup and selection.
+ * @return YES when a changed mode was written, or when no write was needed.
+ */
+static BOOL persistChangedDisplayMode(
+  CGDirectDisplayID displayID,
+  const display_request_t *request,
+  const macos_display_mode_t *baseline
+) {
+  if (!request || !baseline || !validModeSnapshot(baseline) || !request->profile_directory || !request->certificate_fingerprint || request->profile_directory[0] == '\0' || request->certificate_fingerprint[0] == '\0') {
+    return NO;
+  }
+
+  macos_display_mode_t current = {};
+  if (!readCurrentDisplayMode(displayID, &current) || sameDisplayMode(&current, baseline)) {
+    return NO;
+  }
+
+  const macos_display_preference_t preference = {
+    request->requested,
+    current
+  };
+  if (!macos_display_preferences_save(request->profile_directory, request->certificate_fingerprint, &preference)) {
+    fprintf(stderr, "[vd_helper] Could not persist changed virtual-display mode\n");
+    return NO;
+  }
+  fprintf(stderr, "[vd_helper] Persisted changed virtual-display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", current.logical_width, current.logical_height, current.pixel_width, current.pixel_height, current.refresh_rate);
+  return YES;
 }
 
 /**
@@ -586,11 +895,8 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       return 1;
     }
 
-    int width = 0;
-    int height = 0;
-    int fps = 0;
-    BOOL exclusiveMode = NO;
-    if (!parseDisplayArguments(argc, argv, &width, &height, &fps, &exclusiveMode)) {
+    display_request_t request = {};
+    if (!parseDisplayArguments(argc, argv, &request)) {
       fprintf(stderr, "[vd_helper] Invalid holder arguments\n");
       fprintf(stdout, "0\n");
       fflush(stdout);
@@ -604,7 +910,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       return 1;
     }
 
-    if (exclusiveMode && !captureOriginalDisplays()) {
+    if (request.exclusive && !captureOriginalDisplays()) {
       fprintf(stdout, "0\n");
       fflush(stdout);
       return 1;
@@ -627,9 +933,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     desc.name = @"Sunshine Virtual Display";
     desc.vendorID = 0xF0F0;
     desc.productID = 0x5678;
-    desc.serialNum = arc4random();
-    desc.maxPixelsWide = (unsigned int) width;
-    desc.maxPixelsHigh = (unsigned int) height;
+    desc.serialNum = request.helper_serial != 0 ? request.helper_serial : arc4random();
+    desc.maxPixelsWide = MAX(request.requested.width, request.effective.pixel_width);
+    desc.maxPixelsHigh = MAX(request.requested.height, request.effective.pixel_height);
     // Fixed 27" monitor physical size — do NOT scale linearly with resolution.
     // WindowServer rejects displays with unreasonably large physical dimensions.
     desc.sizeInMillimeters = CGSizeMake(597, 336);
@@ -645,33 +951,38 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       shouldExit = 1;
     };
 
-    CGVirtualDisplayMode *nativeMode = [[CGVirtualDisplayMode alloc] initWithWidth:(unsigned int) width
-                                                                            height:(unsigned int) height
-                                                                       refreshRate:(double) fps];
-    if (!nativeMode) {
-      fprintf(stderr, "[vd_helper] Failed to create CGVirtualDisplayMode\n");
+    // Keep the original client-native pair available even when a saved mode
+    // uses a smaller backing store. This lets the user return to the original
+    // resolution in macOS Displays without first deleting the preference.
+    NSMutableArray *availableModes = [NSMutableArray arrayWithCapacity:6];
+    unsigned int modeWidths[6] = {0};
+    unsigned int modeHeights[6] = {0};
+    double modeRefreshRates[6] = {0};
+    NSUInteger modeCount = 0;
+    BOOL modesValid = appendVirtualDisplayMode(availableModes, modeWidths, modeHeights, modeRefreshRates, &modeCount, request.effective.pixel_width, request.effective.pixel_height, request.effective.refresh_rate);
+    if (request.effective.pixel_width >= 2 && request.effective.pixel_height >= 2) {
+      modesValid = modesValid && appendVirtualDisplayMode(availableModes, modeWidths, modeHeights, modeRefreshRates, &modeCount, request.effective.pixel_width / 2, request.effective.pixel_height / 2, request.effective.refresh_rate);
+    }
+    const BOOL targetIsNative = request.effective.logical_width == request.effective.pixel_width &&
+                                request.effective.logical_height == request.effective.pixel_height;
+    const BOOL targetIsHalf = request.effective.pixel_width == request.effective.logical_width * 2 &&
+                              request.effective.pixel_height == request.effective.logical_height * 2;
+    if (!targetIsNative && !targetIsHalf) {
+      modesValid = modesValid && appendVirtualDisplayMode(availableModes, modeWidths, modeHeights, modeRefreshRates, &modeCount, request.effective.logical_width, request.effective.logical_height, request.effective.refresh_rate);
+    }
+    modesValid = modesValid && appendVirtualDisplayMode(availableModes, modeWidths, modeHeights, modeRefreshRates, &modeCount, request.requested.width, request.requested.height, request.requested.refresh_rate);
+    if (request.requested.width >= 2 && request.requested.height >= 2) {
+      modesValid = modesValid && appendVirtualDisplayMode(availableModes, modeWidths, modeHeights, modeRefreshRates, &modeCount, request.requested.width / 2, request.requested.height / 2, request.requested.refresh_rate);
+    }
+    if (!modesValid || modeCount == 0) {
+      fprintf(stderr, "[vd_helper] Failed to create CGVirtualDisplayMode list\n");
       fprintf(stdout, "0\n");
       fflush(stdout);
       return 1;
     }
-
-    // Build mode list with native + half-resolution mode.
-    // With hiDPI=1, macOS selects the native mode as the retina backing store
-    // and the half-res mode as the logical resolution (2x scaling).
-    // Without this, macOS only gives us half the requested pixel resolution.
-    CGVirtualDisplayMode *halfMode = nil;
-    if (width >= 2 && height >= 2) {
-      halfMode = [[CGVirtualDisplayMode alloc] initWithWidth:(unsigned int) (width / 2)
-                                                      height:(unsigned int) (height / 2)
-                                                 refreshRate:(double) fps];
-    }
     CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
     settings.hiDPI = 1;
-    if (halfMode) {
-      settings.modes = @[nativeMode, halfMode];
-    } else {
-      settings.modes = @[nativeMode];
-    }
+    settings.modes = availableModes;
 
     CGVirtualDisplay *display = [[CGVirtualDisplay alloc] initWithDescriptor:desc];
     __block BOOL settingsApplied = NO;
@@ -714,9 +1025,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
 
     fprintf(stderr, "[vd_helper] Display %u created, activating...\n", resultID);
 
-    if (!parentIsAlive() || shouldExit || !activateVirtualDisplay(resultID, exclusiveMode)) {
+    if (!parentIsAlive() || shouldExit || !activateVirtualDisplay(resultID, request.exclusive)) {
       fprintf(stderr, "[vd_helper] Virtual display activation failed\n");
-      if (exclusiveMode) {
+      if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
@@ -731,7 +1042,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
 
     if (!parentIsAlive() || shouldExit) {
       fprintf(stderr, "[vd_helper] Parent exited while activating virtual display\n");
-      if (exclusiveMode) {
+      if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
@@ -747,37 +1058,10 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       forceExtendMode(resultID);
     }
 
-    // Step 3: Switch to native resolution (1x scale) mode.
-    // The display starts as retina 2x (logical=half, pixel=full).
-    // For streaming, we want native 1x (logical=full, pixel=full) to avoid
-    // compositor overhead that causes latency and FPS drops.
-    {
-      NSDictionary *opts = @{(NSString *) kCGDisplayShowDuplicateLowResolutionModes: @YES};
-      CFArrayRef allModes = CGDisplayCopyAllDisplayModes(resultID, (CFDictionaryRef) opts);
-      if (allModes) {
-        CGDisplayModeRef nativeMode = NULL;
-        CFIndex modeCount = CFArrayGetCount(allModes);
-        for (CFIndex i = 0; i < modeCount; i++) {
-          CGDisplayModeRef m = (CGDisplayModeRef) CFArrayGetValueAtIndex(allModes, i);
-          size_t lw = CGDisplayModeGetWidth(m);
-          size_t lh = CGDisplayModeGetHeight(m);
-          size_t pw = CGDisplayModeGetPixelWidth(m);
-          size_t ph = CGDisplayModeGetPixelHeight(m);
-          // Find the 1x native mode matching our requested resolution
-          if ((int) lw == width && (int) lh == height && pw == lw && ph == lh) {
-            nativeMode = m;
-            break;
-          }
-        }
-        if (nativeMode) {
-          CGError modeErr = CGDisplaySetDisplayMode(resultID, nativeMode, NULL);
-          fprintf(stderr, "[vd_helper] Switched to native %dx%d (1x scale): %d\n", width, height, modeErr);
-        } else {
-          fprintf(stderr, "[vd_helper] Native %dx%d mode not found, staying at retina 2x\n", width, height);
-        }
-        CFRelease(allModes);
-      }
-    }
+    // Step 3: Select the logical/backing mode requested by the client profile.
+    // The default request selects the native 1x mode. A saved HiDPI mode selects
+    // the matching logical half-resolution mode when WindowServer exposes it.
+    (void) selectRequestedDisplayMode(resultID, &request);
 
     // Wait for mode switch to take effect
     usleep(500000);  // 500ms
@@ -795,11 +1079,11 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       found = checkDisplayInList(resultID, &count);
     }
 
-    fprintf(stderr, "[vd_helper] Display %u (%dx%d@%dHz) - %s in active list (%u total)\n", resultID, width, height, fps, found ? "FOUND" : "NOT found", count);
+    fprintf(stderr, "[vd_helper] Display %u (%ux%u@%uHz requested) - %s in active list (%u total)\n", resultID, request.requested.width, request.requested.height, request.requested.refresh_rate, found ? "FOUND" : "NOT found", count);
 
     if (!waitForDisplayReady(resultID)) {
       fprintf(stderr, "[vd_helper] Display %u did not become online and active\n", resultID);
-      if (exclusiveMode) {
+      if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
@@ -809,7 +1093,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       return 1;
     }
 
-    if (exclusiveMode && !applyExclusiveMode(resultID)) {
+    if (request.exclusive && !applyExclusiveMode(resultID)) {
       fprintf(stderr, "[vd_helper] Could not enter exclusive display mode\n");
       restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       keepAlive = nil;
@@ -821,7 +1105,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
 
     if (!parentIsAlive() || shouldExit) {
       fprintf(stderr, "[vd_helper] Parent exited before virtual display became ready\n");
-      if (exclusiveMode) {
+      if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
       }
       keepAlive = nil;
@@ -843,6 +1127,16 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper]   ours[%u]: online=%d, active=%d, inMirror=%d, mirrors=%u\n", resultID, CGDisplayIsOnline(resultID), CGDisplayIsActive(resultID), CGDisplayIsInMirrorSet(resultID), CGDisplayMirrorsDisplay(resultID));
     }
 
+    // The holder process has the reliable CoreGraphics mode view. Capture the
+    // post-startup baseline here so a startup fallback is never mistaken for a
+    // user-selected mode during teardown.
+    macos_display_mode_t baselineMode = {};
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    const BOOL baselineAvailable = readCurrentDisplayMode(resultID, &baselineMode);
+    if (!baselineAvailable) {
+      fprintf(stderr, "[vd_helper] Could not read a complete baseline display mode; mode persistence disabled for this session\n");
+    }
+
     fprintf(stdout, "%u\n", resultID);
     fflush(stdout);
 
@@ -854,6 +1148,12 @@ static int runDisplayHolder(int argc, const char *argv[]) {
         break;
       }
       CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+    }
+
+    // Snapshot before restoring physical displays or releasing the virtual
+    // display. Geometry-only fallback is intentionally not persisted.
+    if (baselineAvailable) {
+      (void) persistChangedDisplayMode(resultID, &request, &baselineMode);
     }
 
     if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
@@ -970,28 +1270,39 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
     return 1;
   }
 
-  int width = 0;
-  int height = 0;
-  int fps = 0;
-  BOOL exclusiveMode = NO;
-  if (!parseDisplayArguments(argc, argv, &width, &height, &fps, &exclusiveMode)) {
+  display_request_t request = {};
+  if (!parseDisplayArguments(argc, argv, &request)) {
     fprintf(stderr, "[vd_helper] Invalid guardian arguments\n");
     writeGuardianDisplayID(0);
     return 1;
   }
 
-  char widthString[16];
-  char heightString[16];
-  char fpsString[16];
-  snprintf(widthString, sizeof(widthString), "%d", width);
-  snprintf(heightString, sizeof(heightString), "%d", height);
-  snprintf(fpsString, sizeof(fpsString), "%d", fps);
+  char requestedWidthString[16];
+  char requestedHeightString[16];
+  char requestedRefreshString[16];
+  char logicalWidthString[16];
+  char logicalHeightString[16];
+  char pixelWidthString[16];
+  char pixelHeightString[16];
+  char effectiveRefreshString[32];
+  char hidpiString[2];
+  char serialString[16];
+  snprintf(requestedWidthString, sizeof(requestedWidthString), "%u", request.requested.width);
+  snprintf(requestedHeightString, sizeof(requestedHeightString), "%u", request.requested.height);
+  snprintf(requestedRefreshString, sizeof(requestedRefreshString), "%u", request.requested.refresh_rate);
+  snprintf(logicalWidthString, sizeof(logicalWidthString), "%u", request.effective.logical_width);
+  snprintf(logicalHeightString, sizeof(logicalHeightString), "%u", request.effective.logical_height);
+  snprintf(pixelWidthString, sizeof(pixelWidthString), "%u", request.effective.pixel_width);
+  snprintf(pixelHeightString, sizeof(pixelHeightString), "%u", request.effective.pixel_height);
+  snprintf(effectiveRefreshString, sizeof(effectiveRefreshString), "%.6f", request.effective.refresh_rate);
+  snprintf(hidpiString, sizeof(hidpiString), "%d", request.effective.hidpi ? 1 : 0);
+  snprintf(serialString, sizeof(serialString), "%u", request.helper_serial);
   if (!installSignalHandlers()) {
     fprintf(stderr, "[vd_helper] Guardian could not install signal handlers: %s\n", strerror(errno));
     writeGuardianDisplayID(0);
     return 1;
   }
-  if (exclusiveMode && !captureOriginalDisplays()) {
+  if (request.exclusive && !captureOriginalDisplays()) {
     writeGuardianDisplayID(0);
     return 1;
   }
@@ -1004,13 +1315,22 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
     return 1;
   }
 
-  const char *mode = exclusiveMode ? "exclusive" : "extend";
+  const char *mode = request.exclusive ? "exclusive" : "extend";
   const char *holderArguments[] = {
     argv[0],
     "--holder",
-    widthString,
-    heightString,
-    fpsString,
+    requestedWidthString,
+    requestedHeightString,
+    requestedRefreshString,
+    logicalWidthString,
+    logicalHeightString,
+    pixelWidthString,
+    pixelHeightString,
+    effectiveRefreshString,
+    hidpiString,
+    serialString,
+    request.profile_directory,
+    request.certificate_fingerprint,
     mode,
     NULL,
   };
@@ -1035,7 +1355,7 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
     if (!holderReaped && !vd_terminate_and_reap(holderPID, 40, 20, 100000, &holderStatus)) {
       fprintf(stderr, "[vd_helper] Guardian could not reap failed holder pid=%d\n", holderPID);
     }
-    if (exclusiveMode && !recoverOriginalDisplays(displayID)) {
+    if (request.exclusive && !recoverOriginalDisplays(displayID)) {
       fprintf(stderr, "[vd_helper] Guardian recovery after holder startup failure failed\n");
     }
     if (!shouldExit && parentIsAlive()) {
@@ -1070,7 +1390,7 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
   }
 
   BOOL restored = YES;
-  if (exclusiveMode) {
+  if (request.exclusive) {
     restored = recoverOriginalDisplays(displayID);
     if (!restored) {
       fprintf(stderr, "[vd_helper] Guardian could not restore the saved physical displays\n");

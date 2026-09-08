@@ -16,11 +16,16 @@ Retained capabilities:
 - Create a macOS virtual display matching the connecting client's requested mode.
 - Use ScreenCaptureKit for video capture of session-owned virtual displays on macOS
   12.3 and later, resolving the current display again when a stream starts after
-  recreation. The native Sunshine audio capture path remains unchanged.
+  recreation. Host audio uses Sunshine's native capture path.
 - Optionally make it the only active display for the streaming session, using
   temporary display configuration owned by the helper.
 - Target input at the current captured display, including its current logical
   bounds, instead of caching the physical display's scale or dimensions.
+- Persist a virtual-display mode changed in macOS Displays under the paired
+  client's certificate fingerprint and exact requested width, height, and frame
+  rate. A matching reconnect restores both logical and backing-pixel dimensions.
+  Requests from another paired client or for another tuple never inherit the
+  live display; they retry after its current session has finished.
 - Keep the `CGVirtualDisplay` lifecycle in a dedicated helper. Private hardware
   enablement targets physical displays only. Normal shutdown restores them
   before releasing the virtual display; a surviving supervisor also restores

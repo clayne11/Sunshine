@@ -27,11 +27,14 @@ target_link_options(sunshine PRIVATE -Wl,-U,_CGPreflightScreenCaptureAccess -Wl,
 
 # Keep private virtual-display APIs in a small helper process. Its lifetime
 # follows Sunshine, and the controller expects it beside the server executable.
-add_executable(vd_helper "${CMAKE_SOURCE_DIR}/src/platform/macos/vd_helper.m")
+add_executable(vd_helper
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/vd_helper.m"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/display_preferences.cpp")
 set_source_files_properties(
         "${CMAKE_SOURCE_DIR}/src/platform/macos/vd_helper.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 target_link_libraries(vd_helper PRIVATE
+        nlohmann_json::nlohmann_json
         "-framework Foundation"
         "-framework AppKit"
         "-framework CoreGraphics"

@@ -78,6 +78,12 @@ namespace rtsp_stream {
   [[nodiscard]] bool launch_session_pending();
 
   /**
+   * @brief Check whether the pending launch can reuse the current virtual display.
+   * @return True when a launch is pending for the same paired client and requested mode.
+   */
+  [[nodiscard]] bool launch_session_pending_matches_virtual_display();
+
+  /**
    * @brief Clear state for the specified launch session.
    * @param launch_session_id The ID of the session to clear.
    */

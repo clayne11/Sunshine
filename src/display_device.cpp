@@ -22,8 +22,10 @@
 
 // local includes
 #include "audio.h"
+#include "crypto.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "utility.h"
 
 // platform-specific includes
 #ifdef _WIN32
@@ -52,6 +54,9 @@ namespace display_device {
       std::mutex mutex {};
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
+#ifdef __APPLE__
+      std::filesystem::path display_preferences_directory;  ///< Profile directory for per-client virtual-display modes.
+#endif
     } DD_DATA;
 
     std::mutex VIRTUAL_DISPLAY_MUTEX;  ///< Serializes native virtual-display ownership and lifecycle calls.
@@ -151,6 +156,54 @@ namespace display_device {
       return !value.empty() && std::ranges::all_of(value, [](unsigned char character) {
         return std::isdigit(character);
       });
+    }
+
+    /**
+     * @brief Derive the stable profile key for a paired client certificate.
+     * @param certificate PEM certificate associated with the launch session.
+     * @return SHA-256 certificate fingerprint, or an empty string when no certificate is present.
+     */
+    std::string display_preferences_fingerprint(std::string_view certificate) {
+      if (certificate.empty()) {
+        return {};
+      }
+      return util::hex(crypto::hash(certificate)).to_string();
+    }
+
+    /**
+     * @brief Derive a stable 32-bit display serial from a certificate fingerprint.
+     * @param fingerprint Hexadecimal certificate fingerprint.
+     * @return Non-zero serial suitable for a CGVirtualDisplay descriptor.
+     */
+    uint32_t display_preferences_serial(std::string_view fingerprint) {
+      if (fingerprint.empty()) {
+        return 0;
+      }
+
+      const auto digest {crypto::hash(fingerprint)};
+      uint32_t serial {
+        (static_cast<uint32_t>(digest[0]) << 24) |
+        (static_cast<uint32_t>(digest[1]) << 16) |
+        (static_cast<uint32_t>(digest[2]) << 8) |
+        static_cast<uint32_t>(digest[3])
+      };
+      return serial == 0 ? 1 : serial;
+    }
+
+    /**
+     * @brief Build the default one-to-one mode for a Moonlight request.
+     * @param session Session carrying the requested dimensions and refresh rate.
+     * @return Native logical and backing mode used when no client override exists.
+     */
+    macos_display_mode_t default_virtual_display_mode(const rtsp_stream::launch_session_t &session) {
+      return macos_display_mode_t {
+        static_cast<uint32_t>(session.width),
+        static_cast<uint32_t>(session.height),
+        static_cast<uint32_t>(session.width),
+        static_cast<uint32_t>(session.height),
+        static_cast<double>(session.fps),
+        false
+      };
     }
 #endif
 
@@ -772,16 +825,41 @@ namespace display_device {
     return true;
   }
 
-  bool virtual_display_ownership_t::mark_created(uint32_t launch_session_id) {
+  bool virtual_display_ownership_t::mark_created(
+    uint32_t launch_session_id,
+    std::string_view client_certificate,
+    int width,
+    int height,
+    int fps
+  ) {
     if (!owner_id_ || *owner_id_ != launch_session_id) {
       return false;
     }
     created_ = true;
+    session_identity_ = session_identity_t {
+      std::string {client_certificate},
+      width,
+      height,
+      fps
+    };
     return true;
   }
 
   bool virtual_display_ownership_t::is_created_by(uint32_t launch_session_id) const {
     return created_ && owner_id_ && *owner_id_ == launch_session_id;
+  }
+
+  bool virtual_display_ownership_t::matches(
+    std::string_view client_certificate,
+    int width,
+    int height,
+    int fps
+  ) const {
+    return created_ && session_identity_ &&
+           session_identity_->client_certificate == client_certificate &&
+           session_identity_->width == width &&
+           session_identity_->height == height &&
+           session_identity_->fps == fps;
   }
 
   bool virtual_display_ownership_t::release(uint32_t launch_session_id) {
@@ -795,6 +873,7 @@ namespace display_device {
   void virtual_display_ownership_t::reset() {
     owner_id_.reset();
     created_ = false;
+    session_identity_.reset();
   }
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
@@ -803,6 +882,12 @@ namespace display_device {
     revert_configuration_unlocked(revert_option_e::try_once);
     DD_DATA.config_revert_delay = video_config.dd.config_revert_delay;
     DD_DATA.sm_instance = nullptr;
+#ifdef __APPLE__
+    DD_DATA.display_preferences_directory = persistence_filepath.parent_path() / "display-preferences";
+    if (DD_DATA.display_preferences_directory.empty()) {
+      DD_DATA.display_preferences_directory = std::filesystem::path {"display-preferences"};
+    }
+#endif
 
     // If we fail to create settings manager, this means platform is not supported, and
     // we will need to provided error-free pass-trough in other methods
@@ -836,6 +921,9 @@ namespace display_device {
         }
 
         DD_DATA.sm_instance = nullptr;
+#ifdef __APPLE__
+        DD_DATA.display_preferences_directory.clear();
+#endif
       }
     };
 
@@ -933,7 +1021,39 @@ namespace display_device {
       BOOST_LOG(warning) << "Replacing an unowned or stale virtual display";
       ::virtual_display_destroy();
     }
-    const auto display_id = ::virtual_display_create(session.width, session.height, session.fps, video_config.virtual_display_exclusive);
+
+    macos_display_requested_mode_t requested_mode {
+      static_cast<uint32_t>(session.width),
+      static_cast<uint32_t>(session.height),
+      static_cast<uint32_t>(session.fps)
+    };
+    macos_display_mode_t effective_mode {default_virtual_display_mode(session)};
+    std::string certificate_fingerprint {display_preferences_fingerprint(session.client_cert)};
+    std::filesystem::path profile_directory;
+    {
+      std::lock_guard display_data_lock {DD_DATA.mutex};
+      profile_directory = DD_DATA.display_preferences_directory;
+    }
+
+    bool has_preference = false;
+    if (!certificate_fingerprint.empty() && !profile_directory.empty()) {
+      macos_display_preference_t preference {};
+      if (macos_display_preferences_load(profile_directory.c_str(), certificate_fingerprint.c_str(), &requested_mode, &preference)) {
+        effective_mode = preference.mode;
+        has_preference = true;
+      }
+    }
+
+    virtual_display_request_t display_request {
+      requested_mode,
+      effective_mode,
+      display_preferences_serial(certificate_fingerprint),
+      profile_directory.empty() || certificate_fingerprint.empty() ? nullptr : profile_directory.c_str(),
+      certificate_fingerprint.empty() ? nullptr : certificate_fingerprint.c_str(),
+      has_preference,
+      video_config.virtual_display_exclusive
+    };
+    const auto display_id = ::virtual_display_create_with_request(&display_request);
     if (display_id == 0) {
       // Clear the helper's requested state as well as our reservation. The
       // ownership mutex proves that no other launch can own this helper.
@@ -942,12 +1062,36 @@ namespace display_device {
       BOOST_LOG(error) << "Could not create the requested virtual display";
       return false;
     }
-    (void) VIRTUAL_DISPLAY_OWNERSHIP.mark_created(session.id);
-    BOOST_LOG(info) << "Created virtual display " << display_id << " (" << session.width << "x" << session.height << "@" << session.fps << "Hz)";
+    (void) VIRTUAL_DISPLAY_OWNERSHIP.mark_created(
+      session.id,
+      session.client_cert,
+      session.width,
+      session.height,
+      session.fps
+    );
+    BOOST_LOG(info) << "Created virtual display " << display_id << " (requested "
+                    << session.width << "x" << session.height << "@" << session.fps << "Hz, effective "
+                    << effective_mode.logical_width << "x" << effective_mode.logical_height << "@"
+                    << effective_mode.refresh_rate << "Hz" << (has_preference ? ", persisted" : ", default") << ")";
     return true;
 #else
     (void) VIRTUAL_DISPLAY_OWNERSHIP.release(session.id);
     BOOST_LOG(error) << "Automatic virtual displays are supported only on macOS";
+    return false;
+#endif
+  }
+
+  bool virtual_display_matches(const rtsp_stream::launch_session_t &session) {
+    std::lock_guard lock {VIRTUAL_DISPLAY_MUTEX};
+#ifdef __APPLE__
+    return ::virtual_display_get_id() != 0 && VIRTUAL_DISPLAY_OWNERSHIP.matches(
+                                                session.client_cert,
+                                                session.width,
+                                                session.height,
+                                                session.fps
+                                              );
+#else
+    (void) session;
     return false;
 #endif
   }

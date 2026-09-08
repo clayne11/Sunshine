@@ -1056,7 +1056,10 @@ editing the `conf` file in a text editor. Use the examples as reference.
             the last client disconnects and clean it up if startup fails.
             On macOS 12.3 and later, video capture for a session-owned virtual display uses ScreenCaptureKit. The
             capture stream resolves the current virtual display when it starts, allowing a recreated display to be
-            captured after reconnect. Native Sunshine audio capture remains unchanged.
+            captured after reconnect. Host audio uses Sunshine's native capture path.
+            A mode changed in macOS Displays during a session is saved for that paired client's certificate and
+            requested width, height, and frame rate. A later connection with the same tuple restores the saved
+            logical and backing-pixel mode. A different client or requested tuple uses its own default or saved mode.
             @note{This option is only supported on macOS.}
         </td>
     </tr>

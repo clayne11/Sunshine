@@ -1480,6 +1480,12 @@ namespace nvhttp {
     auto launch_session = make_launch_session(host_audio, args, *verified_client);
 
     const bool no_active_sessions = rtsp_stream::session_count() == 0;
+    if (!no_active_sessions && config::video.virtual_display && !display_device::virtual_display_matches(*launch_session)) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "The active virtual display belongs to another client or requested mode");
+      tree.put("root.gamesession", 0);
+      return;
+    }
     if (no_active_sessions) {
       if (!display_device::reserve_virtual_display(config::video, launch_session->id)) {
         tree.put("root.<xmlattr>.status_code", 503);
@@ -1630,6 +1636,12 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args, *verified_client);
 
+    if (!no_active_sessions && config::video.virtual_display && !display_device::virtual_display_matches(*launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "The active virtual display belongs to another client or requested mode");
+      return;
+    }
 
     if (no_active_sessions) {
       if (!display_device::reserve_virtual_display(config::video, launch_session->id)) {

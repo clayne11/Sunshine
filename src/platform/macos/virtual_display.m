@@ -16,6 +16,7 @@
 #include <errno.h>
 #import <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -172,7 +173,36 @@ static NSString *helperPath(void) {
   return [dir stringByAppendingPathComponent:@"vd_helper"];
 }
 
-uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) {
+/**
+ * @brief Check the bounded mode data before crossing the process boundary.
+ * @param request Virtual-display request to validate.
+ * @return YES when requested and effective modes are complete and bounded.
+ */
+static BOOL validDisplayRequest(const virtual_display_request_t *request) {
+  if (!request) {
+    return NO;
+  }
+
+  const macos_display_requested_mode_t requested = request->requested;
+  const macos_display_mode_t effective = request->effective;
+  return requested.width > 0 && requested.width <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         requested.height > 0 && requested.height <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         requested.refresh_rate > 0 && requested.refresh_rate <= MACOS_DISPLAY_PREFERENCE_MAX_REFRESH_RATE &&
+         effective.logical_width > 0 && effective.logical_width <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         effective.logical_height > 0 && effective.logical_height <= MACOS_DISPLAY_PREFERENCE_MAX_LOGICAL_DIMENSION &&
+         effective.pixel_width > 0 && effective.pixel_width <= MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION &&
+         effective.pixel_height > 0 && effective.pixel_height <= MACOS_DISPLAY_PREFERENCE_MAX_PIXEL_DIMENSION &&
+         effective.pixel_width >= effective.logical_width && effective.pixel_height >= effective.logical_height &&
+         isfinite(effective.refresh_rate) && effective.refresh_rate > 0.0 && effective.refresh_rate <= MACOS_DISPLAY_PREFERENCE_MAX_REFRESH_RATE &&
+         effective.hidpi == (effective.pixel_width != effective.logical_width || effective.pixel_height != effective.logical_height);
+}
+
+uint32_t virtual_display_create_with_request(const virtual_display_request_t *request) {
+  if (!validDisplayRequest(request)) {
+    NSLog(@"[Sunshine] Refusing invalid virtual-display request");
+    return 0;
+  }
+
   pthread_mutex_lock(&vd_mutex);
   refreshHelperState();
 
@@ -207,7 +237,7 @@ uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) 
     return 0;
   }
 
-  NSLog(@"[Sunshine] Spawning vd_helper: %@ %d %d %d (%@)", helper, width, height, fps, exclusive ? @"exclusive" : @"extend");
+  NSLog(@"[Sunshine] Spawning vd_helper: %@ %u %u %u (%@)", helper, request->requested.width, request->requested.height, request->requested.refresh_rate, request->exclusive ? @"exclusive" : @"extend");
 
   // Set up pipe for reading displayID from child's stdout
   int pipefd[2];
@@ -220,17 +250,44 @@ uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) 
   }
 
   // Build argv
-  char widthStr[16], heightStr[16], fpsStr[16];
-  snprintf(widthStr, sizeof(widthStr), "%d", width);
-  snprintf(heightStr, sizeof(heightStr), "%d", height);
-  snprintf(fpsStr, sizeof(fpsStr), "%d", fps);
+  char requestedWidthStr[16];
+  char requestedHeightStr[16];
+  char requestedRefreshStr[16];
+  char logicalWidthStr[16];
+  char logicalHeightStr[16];
+  char pixelWidthStr[16];
+  char pixelHeightStr[16];
+  char effectiveRefreshStr[32];
+  char hidpiStr[2];
+  char serialStr[16];
+  snprintf(requestedWidthStr, sizeof(requestedWidthStr), "%u", request->requested.width);
+  snprintf(requestedHeightStr, sizeof(requestedHeightStr), "%u", request->requested.height);
+  snprintf(requestedRefreshStr, sizeof(requestedRefreshStr), "%u", request->requested.refresh_rate);
+  snprintf(logicalWidthStr, sizeof(logicalWidthStr), "%u", request->effective.logical_width);
+  snprintf(logicalHeightStr, sizeof(logicalHeightStr), "%u", request->effective.logical_height);
+  snprintf(pixelWidthStr, sizeof(pixelWidthStr), "%u", request->effective.pixel_width);
+  snprintf(pixelHeightStr, sizeof(pixelHeightStr), "%u", request->effective.pixel_height);
+  snprintf(effectiveRefreshStr, sizeof(effectiveRefreshStr), "%.6f", request->effective.refresh_rate);
+  snprintf(hidpiStr, sizeof(hidpiStr), "%d", request->effective.hidpi ? 1 : 0);
+  snprintf(serialStr, sizeof(serialStr), "%u", request->helper_serial);
 
-  const char *modeStr = exclusive ? "exclusive" : "extend";
+  const char *profileDirectory = request->profile_directory ? request->profile_directory : "";
+  const char *certificateFingerprint = request->certificate_fingerprint ? request->certificate_fingerprint : "";
+  const char *modeStr = request->exclusive ? "exclusive" : "extend";
   const char *argv[] = {
     [helper fileSystemRepresentation],
-    widthStr,
-    heightStr,
-    fpsStr,
+    requestedWidthStr,
+    requestedHeightStr,
+    requestedRefreshStr,
+    logicalWidthStr,
+    logicalHeightStr,
+    pixelWidthStr,
+    pixelHeightStr,
+    effectiveRefreshStr,
+    hidpiStr,
+    serialStr,
+    profileDirectory,
+    certificateFingerprint,
     modeStr,
     NULL
   };
@@ -330,6 +387,25 @@ uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) 
 
   pthread_mutex_unlock(&vd_mutex);
   return displayID;
+}
+
+uint32_t virtual_display_create(int width, int height, int fps, bool exclusive) {
+  if (width <= 0 || height <= 0 || fps <= 0) {
+    return 0;
+  }
+
+  virtual_display_request_t request = {};
+  request.requested.width = (uint32_t) width;
+  request.requested.height = (uint32_t) height;
+  request.requested.refresh_rate = (uint32_t) fps;
+  request.effective.logical_width = (uint32_t) width;
+  request.effective.logical_height = (uint32_t) height;
+  request.effective.pixel_width = (uint32_t) width;
+  request.effective.pixel_height = (uint32_t) height;
+  request.effective.refresh_rate = (double) fps;
+  request.effective.hidpi = false;
+  request.exclusive = exclusive;
+  return virtual_display_create_with_request(&request);
 }
 
 void virtual_display_destroy(void) {

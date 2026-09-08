@@ -2240,7 +2240,7 @@ namespace stream {
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         const bool preserve_virtual_display {
-          config::video.virtual_display && rtsp_stream::launch_session_pending()
+          config::video.virtual_display && rtsp_stream::launch_session_pending_matches_virtual_display()
         };
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
         if (proc::proc.running()) {

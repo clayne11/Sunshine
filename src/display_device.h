@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 // lib includes
 #include <display_device/display_power_interface.h>
@@ -46,9 +47,19 @@ namespace display_device {
     /**
      * @brief Mark the owning session's native virtual display as created.
      * @param launch_session_id Launch-session identifier claiming creation.
+     * @param client_certificate Certificate of the paired client that created the display.
+     * @param width Requested logical width.
+     * @param height Requested logical height.
+     * @param fps Requested refresh rate.
      * @return True when the caller owns the lifecycle and the state was updated.
      */
-    [[nodiscard]] bool mark_created(uint32_t launch_session_id);
+    [[nodiscard]] bool mark_created(
+      uint32_t launch_session_id,
+      std::string_view client_certificate,
+      int width,
+      int height,
+      int fps
+    );
 
     /**
      * @brief Check whether the owning session has created its native display.
@@ -56,6 +67,21 @@ namespace display_device {
      * @return True when the caller owns a created virtual display.
      */
     [[nodiscard]] bool is_created_by(uint32_t launch_session_id) const;
+
+    /**
+     * @brief Check whether a session can safely reuse the created virtual display.
+     * @param client_certificate Certificate of the requesting paired client.
+     * @param width Requested logical width.
+     * @param height Requested logical height.
+     * @param fps Requested refresh rate.
+     * @return True when the created display belongs to the exact client and requested tuple.
+     */
+    [[nodiscard]] bool matches(
+      std::string_view client_certificate,
+      int width,
+      int height,
+      int fps
+    ) const;
 
     /**
      * @brief Release the lifecycle only when it belongs to the caller.
@@ -70,8 +96,17 @@ namespace display_device {
     void reset();
 
   private:
+    /** @brief Authenticated client and requested mode associated with a created display. */
+    struct session_identity_t {
+      std::string client_certificate;  ///< Certificate of the paired client that created the display.
+      int width;  ///< Logical width requested when the display was created.
+      int height;  ///< Logical height requested when the display was created.
+      int fps;  ///< Refresh rate requested when the display was created.
+    };
+
     std::optional<uint32_t> owner_id_;  ///< Launch session holding the lifecycle reservation.
     bool created_ {false};  ///< Whether the owner has created the native display.
+    std::optional<session_identity_t> session_identity_;  ///< Exact session identity allowed to reuse the display.
   };
 
   /**
@@ -165,6 +200,13 @@ namespace display_device {
    * @return True when disabled or ready; false when the requested virtual display cannot be created.
    */
   [[nodiscard]] bool create_virtual_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
+
+  /**
+   * @brief Check whether an existing virtual display matches a launch session.
+   * @param session Authenticated client identity and requested mode to compare.
+   * @return True when the live display was created for the same certificate and tuple.
+   */
+  [[nodiscard]] bool virtual_display_matches(const rtsp_stream::launch_session_t &session);
 
   /**
    * @brief Release a virtual display only when it belongs to a launch session.

@@ -694,6 +694,16 @@ namespace rtsp_stream {
       return launch_event.view(0s) != nullptr;
     }
 
+    /**
+     * @brief Check whether a pending launch matches the live virtual display.
+     * @return True only when both exist and carry the same client identity and mode tuple.
+     */
+    [[nodiscard]] bool session_pending_matches_virtual_display() {
+      std::lock_guard lock {_launch_mutex};
+      const auto pending = launch_event.view(0s);
+      return pending && display_device::virtual_display_matches(*pending);
+    }
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
@@ -838,6 +848,10 @@ namespace rtsp_stream {
 
   bool launch_session_pending() {
     return server.session_pending();
+  }
+
+  bool launch_session_pending_matches_virtual_display() {
+    return server.session_pending_matches_virtual_display();
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
