@@ -364,12 +364,21 @@ static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID, CGConfigureOpti
 }
 
 /**
- * @brief Retry session-scoped physical recovery after a holder failure.
+ * @brief Restore saved physical displays when holder cleanup has not done so.
  * @param virtualID Last virtual display identifier reported by the holder.
  * @return YES when the saved physical display set was restored.
+ * @details Let pending WindowServer notifications settle before deciding whether
+ *          a recovery transaction is still needed.
  */
 static BOOL recoverOriginalDisplays(CGDirectDisplayID virtualID) {
   static const unsigned int attempts = 3;
+  static const CFTimeInterval settleInterval = 0.05;
+
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode, settleInterval, false);
+  if (originalDisplaysAreActive(virtualID)) {
+    return YES;
+  }
+
   for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
     if (restoreOriginalDisplays(virtualID, kCGConfigureForSession)) {
       return YES;
