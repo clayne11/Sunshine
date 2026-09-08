@@ -8,6 +8,7 @@
 // standard includes
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -357,6 +358,21 @@ namespace nvhttp {
    * @brief Test-only accessors for paired-client authorization state.
    */
   namespace test_support {
+    /**
+     * @brief Exercise the production display-preparation order with test callbacks.
+     * @param virtual_display Whether virtual-display bootstrapping is enabled.
+     * @param configure_display Callback that applies display configuration.
+     * @param create_virtual_display Callback that creates the virtual display.
+     * @param probe_encoders Callback that probes video capture and encoding.
+     * @return True when all required preparation steps succeed.
+     */
+    bool prepare_display_and_encoders(
+      bool virtual_display,
+      const std::function<void()> &configure_display,
+      const std::function<bool()> &create_virtual_display,
+      const std::function<int()> &probe_encoders
+    );
+
     /**
      * @brief Dispatch a plain-HTTP pairing request through the production handler.
      *

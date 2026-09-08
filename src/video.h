@@ -23,6 +23,19 @@ struct AVPacket;
 
 namespace video {
 
+#ifdef SUNSHINE_TESTS
+  /** @brief Test-only accessors for encoder probe admission. */
+  namespace test_support {
+    /**
+     * @brief Decide whether encoder probing has a usable physical or virtual target.
+     * @param active_device_has_mode Whether an active device has current-mode metadata.
+     * @param session_virtual_display_ready Whether a live session virtual display is online and active.
+     * @return True when probing may safely continue.
+     */
+    bool encoder_probe_target_available(bool active_device_has_mode, bool session_virtual_display_ready);
+  }  // namespace test_support
+#endif
+
   /**
    * @brief Encoding configuration requested by a remote client.
    */

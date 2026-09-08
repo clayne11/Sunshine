@@ -5,7 +5,11 @@
 #include "../tests_common.h"
 #include "src/config.h"
 #include "src/display_device.h"
+#include "src/nvhttp.h"
 #include "src/rtsp.h"
+
+#include <string>
+#include <vector>
 
 TEST(MacOSVirtualDisplayConfig, DisabledFeatureDoesNotCreateDisplay) {
   config::video_t video_config {};
@@ -37,4 +41,72 @@ TEST(MacOSVirtualDisplayConfig, RejectsInvalidModesBeforeChangingDisplays) {
     EXPECT_FALSE(display_device::create_virtual_display(video_config, session))
       << mode[0] << 'x' << mode[1] << '@' << mode[2];
   }
+}
+
+TEST(NvHttpDisplayPreparation, CreatesVirtualDisplayBeforeEncoderProbe) {
+  std::vector<std::string> operations;
+
+  EXPECT_TRUE(nvhttp::test_support::prepare_display_and_encoders(true, [&]() {
+    operations.emplace_back("configure");
+  },
+                                                                 [&]() {
+                                                                   operations.emplace_back("create");
+                                                                   return true;
+                                                                 },
+                                                                 [&]() {
+                                                                   operations.emplace_back("probe");
+                                                                   return 0;
+                                                                 }));
+  EXPECT_EQ(operations, (std::vector<std::string> {"configure", "create", "probe"}));
+}
+
+TEST(NvHttpDisplayPreparation, StopsBeforeProbeWhenVirtualDisplayCreationFails) {
+  std::vector<std::string> operations;
+
+  EXPECT_FALSE(nvhttp::test_support::prepare_display_and_encoders(true, [&]() {
+    operations.emplace_back("configure");
+  },
+                                                                  [&]() {
+                                                                    operations.emplace_back("create");
+                                                                    return false;
+                                                                  },
+                                                                  [&]() {
+                                                                    operations.emplace_back("probe");
+                                                                    return 0;
+                                                                  }));
+  EXPECT_EQ(operations, (std::vector<std::string> {"configure", "create"}));
+}
+
+TEST(NvHttpDisplayPreparation, PropagatesEncoderProbeFailureAfterVirtualDisplayCreation) {
+  std::vector<std::string> operations;
+
+  EXPECT_FALSE(nvhttp::test_support::prepare_display_and_encoders(true, [&]() {
+    operations.emplace_back("configure");
+  },
+                                                                  [&]() {
+                                                                    operations.emplace_back("create");
+                                                                    return true;
+                                                                  },
+                                                                  [&]() {
+                                                                    operations.emplace_back("probe");
+                                                                    return -1;
+                                                                  }));
+  EXPECT_EQ(operations, (std::vector<std::string> {"configure", "create", "probe"}));
+}
+
+TEST(NvHttpDisplayPreparation, LeavesPhysicalDisplayOrderingUnchanged) {
+  std::vector<std::string> operations;
+
+  EXPECT_TRUE(nvhttp::test_support::prepare_display_and_encoders(false, [&]() {
+    operations.emplace_back("configure");
+  },
+                                                                 [&]() {
+                                                                   operations.emplace_back("create");
+                                                                   return false;
+                                                                 },
+                                                                 [&]() {
+                                                                   operations.emplace_back("probe");
+                                                                   return 0;
+                                                                 }));
+  EXPECT_EQ(operations, (std::vector<std::string> {"configure", "probe"}));
 }

@@ -194,7 +194,7 @@ namespace display_device {
   [[nodiscard]] bool reserve_virtual_display(const config::video_t &video_config, uint32_t launch_session_id);
 
   /**
-   * @brief Prepare a temporary macOS display after encoder probing succeeds.
+   * @brief Prepare a temporary macOS display before encoder probing.
    * @param video_config Display configuration, including the opt-in virtual-display policy.
    * @param session Client-requested dimensions and refresh rate.
    * @return True when disabled or ready; false when the requested virtual display cannot be created.

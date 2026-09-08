@@ -25,6 +25,12 @@ extern "C" {
 
 using namespace std::literals;
 
+TEST(EncoderProbeAdmission, AcceptsLiveVirtualDisplayWithoutModeMetadata) {
+  EXPECT_TRUE(video::test_support::encoder_probe_target_available(false, true));
+  EXPECT_TRUE(video::test_support::encoder_probe_target_available(true, false));
+  EXPECT_FALSE(video::test_support::encoder_probe_target_available(false, false));
+}
+
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {
   void SetUp() override {
     BaseTest::SetUp();

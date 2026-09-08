@@ -14,6 +14,11 @@ starting this fork. Existing copyright and license terms remain applicable.
 Retained capabilities:
 
 - Create a macOS virtual display matching the connecting client's requested mode.
+- Create the virtual display before the first-session encoder probe so a headless
+  or temporarily inactive physical desktop can bootstrap its capture target. A
+  live Sunshine-owned virtual display may proceed when the parent process cannot
+  read its current CoreGraphics mode; capture initialization remains the final
+  readiness check.
 - Use ScreenCaptureKit for video capture of session-owned virtual displays on macOS
   12.3 and later, resolving the current display again when a stream starts after
   recreation. Host audio uses Sunshine's native capture path.

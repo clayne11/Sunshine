@@ -36,6 +36,12 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 
+#ifdef __APPLE__
+  #include "platform/macos/virtual_display.h"
+
+  #include <CoreGraphics/CoreGraphics.h>
+#endif
+
 #ifdef _WIN32
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
@@ -47,6 +53,29 @@ using namespace std::literals;
 namespace video {
 
   namespace {
+    /**
+     * @brief Decide whether encoder probing has a usable display target.
+     * @param active_device_has_mode Whether libdisplaydevice found an active display with current-mode metadata.
+     * @param session_virtual_display_ready Whether Sunshine owns a live, active virtual display for this launch.
+     * @return True when either source establishes a usable capture target.
+     */
+    bool encoder_probe_target_available(bool active_device_has_mode, bool session_virtual_display_ready) {
+      return active_device_has_mode || session_virtual_display_ready;
+    }
+
+#ifdef __APPLE__
+    /**
+     * @brief Check whether Sunshine's current virtual display is live and active.
+     * @return True when the controller owns a requested display that CoreGraphics reports online and active.
+     */
+    bool session_virtual_display_ready() {
+      virtual_display_state_t state {};
+      virtual_display_get_state(&state);
+      return state.requested && state.display_id != 0 &&
+             CGDisplayIsOnline(state.display_id) && CGDisplayIsActive(state.display_id);
+    }
+#endif
+
     /**
      * @brief Check if we can allow probing for the encoders.
      * @return True if there should be no issues with the probing, false if we should prevent it.
@@ -68,7 +97,11 @@ namespace video {
         return static_cast<bool>(device.m_info);
       });
 
-      if (at_least_one_device_is_active) {
+      bool live_session_virtual_display = false;
+#ifdef __APPLE__
+      live_session_virtual_display = session_virtual_display_ready();
+#endif
+      if (encoder_probe_target_available(at_least_one_device_is_active, live_session_virtual_display)) {
         return true;
       }
 
@@ -3475,6 +3508,14 @@ namespace video {
 
     return 0;
   }
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    bool encoder_probe_target_available(bool active_device_has_mode, bool session_virtual_display_ready) {
+      return video::encoder_probe_target_available(active_device_has_mode, session_virtual_display_ready);
+    }
+  }  // namespace test_support
+#endif
 
   // Linux only declaration
   /**

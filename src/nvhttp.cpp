@@ -52,6 +52,37 @@ namespace nvhttp {
   namespace pt = boost::property_tree;
 
   namespace {
+    /** @brief Result of preparing the first session's display and encoder. */
+    enum class display_preparation_result_e {
+      ready,  ///< Display and encoder probe succeeded.
+      virtual_display_failed,  ///< The requested virtual display could not be created.
+      encoder_probe_failed  ///< Video capture or encoder probing failed.
+    };
+
+    /**
+     * @brief Prepare the display target before probing encoders for a first session.
+     * @param virtual_display Whether a virtual display must bootstrap capture.
+     * @param configure_display Callback that applies display configuration.
+     * @param create_virtual_display Callback that creates the virtual display.
+     * @param probe_encoders Callback that probes capture and encoders.
+     * @return Detailed preparation result for the protocol response.
+     */
+    display_preparation_result_e prepare_display_and_encoders(
+      bool virtual_display,
+      const std::function<void()> &configure_display,
+      const std::function<bool()> &create_virtual_display,
+      const std::function<int()> &probe_encoders
+    ) {
+      configure_display();
+      if (virtual_display && !create_virtual_display()) {
+        return display_preparation_result_e::virtual_display_failed;
+      }
+      if (probe_encoders() != 0) {
+        return display_preparation_result_e::encoder_probe_failed;
+      }
+      return display_preparation_result_e::ready;
+    }
+
     /**
      * @brief Log one GameStream request without exposing its query parameters.
      * @details The sequence number correlates request entry and completion while
@@ -1479,6 +1510,17 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args, *verified_client);
 
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
+
     const bool no_active_sessions = rtsp_stream::session_count() == 0;
     if (!no_active_sessions && config::video.virtual_display && !display_device::virtual_display_matches(*launch_session)) {
       tree.put("root.<xmlattr>.status_code", 503);
@@ -1500,40 +1542,31 @@ namespace nvhttp {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
-
-      // Probe encoders again before streaming to ensure our chosen
-      // encoder matches the active GPU (which could have changed
-      // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
+      const auto preparation_result = prepare_display_and_encoders(
+        config::video.virtual_display,
+        [&]() {
+          display_device::configure_display(config::video, *launch_session);
+        },
+        [&]() {
+          return display_device::create_virtual_display(config::video, *launch_session);
+        },
+        []() {
+          return video::probe_encoders();
+        }
+      );
+      if (preparation_result == display_preparation_result_e::virtual_display_failed) {
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
+        tree.put("root.gamesession", 0);
+        return;
+      }
+      if (preparation_result == display_preparation_result_e::encoder_probe_failed) {
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
         tree.put("root.gamesession", 0);
 
         return;
       }
-    }
-
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
-      return;
-    }
-
-    if (no_active_sessions && !display_device::create_virtual_display(config::video, *launch_session)) {
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
-      tree.put("root.gamesession", 0);
-      return;
     }
 
     if (appid > 0) {
@@ -1636,6 +1669,17 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args, *verified_client);
 
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.resume", 0);
+
+      return;
+    }
+
     if (!no_active_sessions && config::video.virtual_display && !display_device::virtual_display_matches(*launch_session)) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
@@ -1654,40 +1698,29 @@ namespace nvhttp {
         virtual_display_owner_id = launch_session->id;
       }
 
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
-
-      // Probe encoders again before streaming to ensure our chosen
-      // encoder matches the active GPU (which could have changed
-      // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
+      const auto preparation_result = prepare_display_and_encoders(
+        config::video.virtual_display,
+        [&]() {
+          display_device::configure_display(config::video, *launch_session);
+        },
+        [&]() {
+          return display_device::create_virtual_display(config::video, *launch_session);
+        },
+        []() {
+          return video::probe_encoders();
+        }
+      );
+      if (preparation_result == display_preparation_result_e::virtual_display_failed) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
+        return;
+      }
+      if (preparation_result == display_preparation_result_e::encoder_probe_failed) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
 
-        return;
-      }
-    }
-
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
-      return;
-    }
-
-    if (no_active_sessions) {
-      if (!display_device::create_virtual_display(config::video, *launch_session)) {
-        tree.put("root.resume", 0);
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Failed to prepare the requested virtual display");
         return;
       }
     }
@@ -1988,6 +2021,20 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    bool prepare_display_and_encoders(
+      bool virtual_display,
+      const std::function<void()> &configure_display,
+      const std::function<bool()> &create_virtual_display,
+      const std::function<int()> &probe_encoders
+    ) {
+      return nvhttp::prepare_display_and_encoders(
+               virtual_display,
+               configure_display,
+               create_virtual_display,
+               probe_encoders
+             ) == display_preparation_result_e::ready;
+    }
+
     void pair_http(
       std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> response,
       std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Request> request
