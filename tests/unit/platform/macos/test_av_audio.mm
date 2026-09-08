@@ -14,6 +14,10 @@
   #import <Foundation/Foundation.h>
   #import <src/platform/macos/av_audio.h>
 
+  // standard includes
+  #include <limits>
+  #include <vector>
+
 /**
  * @brief Test parameters for processSystemAudioIOProc tests.
  * Contains various audio configuration parameters to test different scenarios.
@@ -351,6 +355,67 @@ TEST_F(AVAudioTest, BufferManagementEdgeCases) {
     EXPECT_NE(avAudio->audioSemaphore, nullptr);
     [avAudio cleanupAudioBuffer];
 
+    [avAudio release];
+  }
+  @catch (NSException *exception) {
+    FAIL() << "Caught NSException: " << ([exception.reason UTF8String] ?: "unknown reason");
+  }
+}
+
+/**
+ * @brief Test that a synthetic Core Audio callback updates bounded telemetry.
+ *
+ * This exercises callback frame, buffer, timestamp-age, and producer-write
+ * counters without opening a real audio device.
+ */
+TEST_F(AVAudioTest, SystemAudioTelemetryRecordsSyntheticCallback) {
+  @try {
+    AVAudio *avAudio = [[AVAudio alloc] init];
+    ASSERT_NE(avAudio, nil);
+    [avAudio initializeAudioBuffer:2];
+
+    AVAudioTelemetry telemetry {};
+    telemetry.deadlineHostTime = std::numeric_limits<std::uint64_t>::max();
+    telemetry.collecting.store(true, std::memory_order_release);
+
+    constexpr UInt32 frameCount = 240;
+    constexpr UInt32 channels = 2;
+    std::vector<float> samples(frameCount * channels, 0.25f);
+    AudioBufferList input = {};
+    input.mNumberBuffers = 1;
+    input.mBuffers[0].mNumberChannels = channels;
+    input.mBuffers[0].mDataByteSize = static_cast<UInt32>(samples.size() * sizeof(float));
+    input.mBuffers[0].mData = samples.data();
+
+    AudioTimeStamp inputTime = {};
+    inputTime.mFlags = kAudioTimeStampHostTimeValid;
+    inputTime.mHostTime = 1;
+    AudioBufferList output = {};
+
+    AVAudioIOProcData procData = {};
+    procData.avAudio = avAudio;
+    procData.telemetry = &telemetry;
+    procData.clientRequestedChannels = channels;
+    procData.clientRequestedFrameSize = frameCount;
+    procData.clientRequestedSampleRate = 48000;
+    procData.aggregateDeviceSampleRate = 48000;
+    procData.aggregateDeviceChannels = channels;
+
+    EXPECT_EQ(platf::systemAudioIOProc(0, nullptr, &input, &inputTime, &output, nullptr, &procData), noErr);
+    EXPECT_EQ(platf::systemAudioIOProc(0, nullptr, &input, &inputTime, &output, nullptr, &procData), noErr);
+
+    EXPECT_EQ(telemetry.callbackCount.load(std::memory_order_relaxed), 2U);
+    EXPECT_EQ(telemetry.callbackFrames.load(std::memory_order_relaxed), 2U * frameCount);
+    EXPECT_EQ(telemetry.callbackMinFrames.load(std::memory_order_relaxed), frameCount);
+    EXPECT_EQ(telemetry.callbackMaxFrames.load(std::memory_order_relaxed), frameCount);
+    EXPECT_EQ(telemetry.callbackMaxBufferBytes.load(std::memory_order_relaxed), input.mBuffers[0].mDataByteSize);
+    EXPECT_EQ(telemetry.callbackMaxBufferCount.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(telemetry.timestampAgeCount.load(std::memory_order_relaxed), 2U);
+    EXPECT_GT(telemetry.timestampMaxAgeTicks.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(telemetry.producerWriteCount.load(std::memory_order_relaxed), 2U);
+    EXPECT_EQ(telemetry.producerDropCount.load(std::memory_order_relaxed), 0U);
+
+    [avAudio cleanupAudioBuffer];
     [avAudio release];
   }
   @catch (NSException *exception) {

@@ -3,6 +3,8 @@
  * @brief Definitions for microphone capture on macOS.
  */
 // local includes
+#include <mach/mach_time.h>
+
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -36,15 +38,21 @@ namespace platf {
       while (remaining > 0) {
         uint32_t avail = 0;
         void *tail = TPCircularBufferTail(&av_audio_capture->audioSampleBuffer, &avail);
+        [av_audio_capture recordAudioConsumerAvailableBytes:avail];
 
         if (avail == 0) {
           // Using 5 second timeout to prevent indefinite hanging
           dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC);
-          if (dispatch_semaphore_wait(av_audio_capture->audioSemaphore, timeout) != 0) {
+          const auto waitStart = mach_absolute_time();
+          const bool timedOut = dispatch_semaphore_wait(av_audio_capture->audioSemaphore, timeout) != 0;
+          const auto waitTicks = mach_absolute_time() - waitStart;
+          [av_audio_capture recordAudioConsumerWait:waitTicks timedOut:timedOut];
+          if (timedOut) {
             BOOST_LOG(warning) << "Audio sample timeout - no audio data received within 5 seconds"sv;
 
             // Fill with silence and return to prevent hanging
             std::fill(sample_in.begin(), sample_in.end(), 0.0f);
+            [av_audio_capture reportAudioTelemetryIfDue:NO];
             return capture_e::timeout;
           }
           continue;
@@ -59,6 +67,7 @@ namespace platf {
         remaining -= toCopy;
       }
 
+      [av_audio_capture reportAudioTelemetryIfDue:NO];
       return capture_e::ok;
     }
   };

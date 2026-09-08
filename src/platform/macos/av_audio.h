@@ -18,7 +18,10 @@
 #import <CoreAudio/CoreAudio.h>
 
 // standard includes
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <limits>
 
 // lib includes
 #include "third-party/TPCircularBuffer/TPCircularBuffer.h"
@@ -90,16 +93,73 @@ struct AudioConverterInputData {
 };
 
 /**
+ * @brief Lock-free, bounded diagnostics for a macOS audio capture session.
+ *
+ * The Core Audio IOProc updates only atomics in this structure.  It never logs,
+ * allocates, or performs Objective-C work.  The consumer thread reports a
+ * single aggregate record after the first telemetry window or during cleanup.
+ */
+struct AVAudioTelemetry {
+  static constexpr UInt32 unknown_value = std::numeric_limits<UInt32>::max();  ///< Sentinel for unavailable Core Audio properties.
+  static constexpr std::uint64_t window_seconds = 30;  ///< Maximum duration of one diagnostic window.
+
+  UInt32 requestedSampleRate {};  ///< Requested client sample rate in hertz.
+  UInt32 requestedFrameSize {};  ///< Requested client frames per packet.
+  UInt32 requestedChannels {};  ///< Requested client channel count.
+  Float64 aggregateSampleRate {};  ///< Aggregate device sample rate in hertz.
+  UInt32 aggregateChannels {unknown_value};  ///< Aggregate device channel count.
+  UInt32 actualBufferFrameSize {unknown_value};  ///< Aggregate device callback buffer size in frames.
+  UInt32 aggregateLatencyFrames {unknown_value};  ///< Aggregate device reported latency in frames.
+  UInt32 aggregateSafetyOffsetFrames {unknown_value};  ///< Aggregate device reported safety offset in frames.
+  std::uint64_t startHostTime {};  ///< Host-time tick at which collection began.
+  std::uint64_t deadlineHostTime {};  ///< Host-time tick at which collection expires.
+
+  std::atomic_bool collecting {false};  ///< Whether the bounded window is active.
+  std::atomic_bool reported {false};  ///< Whether the aggregate record has been emitted.
+
+  std::atomic<std::uint64_t> callbackCount {0};  ///< Number of callbacks observed.
+  std::atomic<std::uint64_t> callbackFrames {0};  ///< Total frames in valid callbacks.
+  std::atomic<UInt32> callbackMinFrames {unknown_value};  ///< Smallest valid callback frame count.
+  std::atomic<UInt32> callbackMaxFrames {0};  ///< Largest valid callback frame count.
+  std::atomic<UInt32> callbackMaxBufferBytes {0};  ///< Largest first-buffer byte count.
+  std::atomic<UInt32> callbackMaxBufferCount {0};  ///< Largest number of buffers in a callback.
+  std::atomic<std::uint64_t> callbackInvalidCount {0};  ///< Number of callbacks without valid input frames.
+
+  std::atomic<std::uint64_t> callbackPeriodCount {0};  ///< Number of measured callback intervals.
+  std::atomic<std::uint64_t> callbackPeriodTicks {0};  ///< Sum of callback intervals in host ticks.
+  std::atomic<std::uint64_t> callbackMaxPeriodTicks {0};  ///< Largest callback interval in host ticks.
+  std::atomic<std::uint64_t> lastCallbackHostTime {0};  ///< Host-time tick of the previous callback.
+
+  std::atomic<std::uint64_t> timestampAgeCount {0};  ///< Number of valid, non-future input timestamps.
+  std::atomic<std::uint64_t> timestampMaxAgeTicks {0};  ///< Largest callback-to-input timestamp age.
+  std::atomic<std::uint64_t> timestampFutureCount {0};  ///< Number of input timestamps ahead of callback time.
+
+  std::atomic<std::uint64_t> producerWriteCount {0};  ///< Number of successful circular-buffer writes.
+  std::atomic<std::uint64_t> producerDropCount {0};  ///< Number of failed circular-buffer writes.
+  std::atomic<UInt32> maxObservedFillBytes {0};  ///< Largest fill observed by the consumer before a read.
+
+  std::atomic<std::uint64_t> consumerEmptyCount {0};  ///< Number of consumer reads that found no bytes.
+  std::atomic<std::uint64_t> consumerWaitCount {0};  ///< Number of semaphore waits by the consumer.
+  std::atomic<std::uint64_t> consumerTimeoutCount {0};  ///< Number of consumer waits that timed out.
+  std::atomic<std::uint64_t> consumerMaxWaitTicks {0};  ///< Largest consumer wait in host ticks.
+};
+
+/**
  * @brief IOProc client data structure for Core Audio system taps.
  * Contains configuration and conversion data for real-time audio processing.
  */
 typedef struct {
   AVAudio *avAudio;  ///< Reference to AVAudio instance
+  AVAudioTelemetry *_Nullable telemetry;  ///< Lock-free diagnostics shared with the consumer thread
   UInt32 clientRequestedChannels;  ///< Number of channels requested by client
   UInt32 clientRequestedSampleRate;  ///< Sample rate requested by client
   UInt32 clientRequestedFrameSize;  ///< Frame size requested by client
   UInt32 aggregateDeviceSampleRate;  ///< Sample rate of the aggregate device
   UInt32 aggregateDeviceChannels;  ///< Number of channels in aggregate device
+  Float64 actualAggregateDeviceSampleRate;  ///< Full precision sample rate reported by Core Audio
+  UInt32 actualBufferFrameSize;  ///< Buffer frame size reported by Core Audio
+  UInt32 aggregateLatencyFrames;  ///< Aggregate device latency in frames
+  UInt32 aggregateSafetyOffsetFrames;  ///< Aggregate device safety offset in frames
   AudioConverterRef _Nullable audioConverter;  ///< Audio converter for format conversion
   float *_Nullable conversionBuffer;  ///< Pre-allocated buffer for audio conversion
   UInt32 conversionBufferSize;  ///< Size of the conversion buffer in bytes
@@ -120,6 +180,7 @@ typedef struct {
   AudioObjectID aggregateDeviceID;  ///< Aggregate device ID for system tap audio routing
   AudioDeviceIOProcID ioProcID;  ///< IOProc identifier for real-time audio processing
   AVAudioIOProcData *_Nullable ioProcData;  ///< Context data for IOProc callbacks and format conversion
+  AVAudioTelemetry *_Nullable audioTelemetry;  ///< Bounded diagnostics for the active audio session
 }
 
 // AVFoundation microphone capture properties
@@ -172,6 +233,42 @@ typedef struct {
  * @param channels Number of audio channels to configure the buffer for
  */
 - (void)initializeAudioBuffer:(UInt8)channels;
+
+/**
+ * @brief Start bounded audio telemetry for the active capture configuration.
+ *
+ * @param sampleRate Requested sample rate in Hz
+ * @param frameSize Requested frames per audio packet
+ * @param channels Requested channel count
+ */
+- (void)configureAudioTelemetry:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels;
+
+/**
+ * @brief Refresh aggregate device properties used by audio telemetry.
+ *
+ * This method is intended for setup code after the aggregate device exists;
+ * it must not be called from the Core Audio IOProc.
+ */
+- (void)refreshAudioTelemetryDeviceProperties;
+
+/**
+ * @brief Record bytes observed by the audio consumer.
+ * @param availableBytes Bytes available before the consumer read.
+ */
+- (void)recordAudioConsumerAvailableBytes:(UInt32)availableBytes;
+
+/**
+ * @brief Record a consumer wait without logging from the producer callback.
+ * @param waitHostTicks Monotonic host-time ticks spent waiting.
+ * @param timedOut Whether the wait reached its timeout.
+ */
+- (void)recordAudioConsumerWait:(std::uint64_t)waitHostTicks timedOut:(BOOL)timedOut;
+
+/**
+ * @brief Emit one aggregate telemetry record when the bounded window expires.
+ * @param force Emit immediately during teardown.
+ */
+- (void)reportAudioTelemetryIfDue:(BOOL)force;
 
 /**
  * @brief Cleans up and deallocates the audio buffer resources.

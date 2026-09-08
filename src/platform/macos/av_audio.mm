@@ -12,7 +12,14 @@
 #import "av_audio.h"
 
 // standard includes
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <mach/mach_time.h>
+#include <new>
+#include <string>
 
 // local includes
 #include "coreaudio_helpers.h"
@@ -21,6 +28,190 @@
 
 #import <AudioToolbox/AudioConverter.h>
 #import <CoreAudio/CATapDescription.h>
+
+namespace {
+  /**
+   * @brief Convert seconds to the host-time tick domain used by AudioTimeStamp.
+   */
+  std::uint64_t host_ticks_for_seconds(std::uint64_t seconds) noexcept {
+    mach_timebase_info_data_t timebase {};
+    mach_timebase_info(&timebase);
+    if (timebase.numer == 0 || timebase.denom == 0) {
+      return seconds * NSEC_PER_SEC;
+    }
+
+    const auto nanoseconds = static_cast<__uint128_t>(seconds) * NSEC_PER_SEC;
+    return static_cast<std::uint64_t>((nanoseconds * timebase.denom) / timebase.numer);
+  }
+
+  /**
+   * @brief Convert host-time ticks to microseconds for non-realtime reporting.
+   */
+  std::uint64_t host_ticks_to_microseconds(std::uint64_t ticks) noexcept {
+    mach_timebase_info_data_t timebase {};
+    mach_timebase_info(&timebase);
+    if (timebase.numer == 0 || timebase.denom == 0) {
+      return ticks / 1000;
+    }
+
+    const auto nanoseconds = (static_cast<__uint128_t>(ticks) * timebase.numer) / timebase.denom;
+    return static_cast<std::uint64_t>(nanoseconds / 1000);
+  }
+
+  /**
+   * @brief Atomically retain the smallest value observed by a diagnostic counter.
+   * @tparam T Atomic value type.
+   * @param target Counter to update.
+   * @param value Candidate value.
+   */
+  template<typename T>
+  void atomic_min(std::atomic<T> &target, T value) noexcept {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value < current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+  }
+
+  /**
+   * @brief Atomically retain the largest value observed by a diagnostic counter.
+   * @tparam T Atomic value type.
+   * @param target Counter to update.
+   * @param value Candidate value.
+   */
+  template<typename T>
+  void atomic_max(std::atomic<T> &target, T value) noexcept {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+  }
+
+  /**
+   * @brief Check the bounded telemetry window without doing any reporting work.
+   */
+  bool telemetry_is_active(AVAudioTelemetry *telemetry, std::uint64_t now) noexcept {
+    if (!telemetry || !telemetry->collecting.load(std::memory_order_acquire)) {
+      return false;
+    }
+
+    if (now >= telemetry->deadlineHostTime) {
+      telemetry->collecting.store(false, std::memory_order_relaxed);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * @brief Read an optional Core Audio UInt32 property without logging.
+   */
+  UInt32 query_device_uint32(AudioObjectID deviceID, AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) noexcept {
+    if (deviceID == kAudioObjectUnknown) {
+      return AVAudioTelemetry::unknown_value;
+    }
+
+    AudioObjectPropertyAddress address {
+      .mSelector = selector,
+      .mScope = scope,
+      .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 value = AVAudioTelemetry::unknown_value;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, &value) != noErr || size < sizeof(value)) {
+      return AVAudioTelemetry::unknown_value;
+    }
+    return value;
+  }
+
+  /**
+   * @brief Read an optional Core Audio Float64 property without logging.
+   */
+  Float64 query_device_float64(AudioObjectID deviceID, AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) noexcept {
+    if (deviceID == kAudioObjectUnknown) {
+      return 0.0;
+    }
+
+    AudioObjectPropertyAddress address {
+      .mSelector = selector,
+      .mScope = scope,
+      .mElement = kAudioObjectPropertyElementMain,
+    };
+    Float64 value = 0.0;
+    UInt32 size = sizeof(value);
+    if (AudioObjectGetPropertyData(deviceID, &address, 0, nullptr, &size, &value) != noErr || size < sizeof(value)) {
+      return 0.0;
+    }
+    return value;
+  }
+
+  /**
+   * @brief Read a device property from global scope, then input scope.
+   */
+  UInt32 query_device_uint32_with_input_fallback(AudioObjectID deviceID, AudioObjectPropertySelector selector) noexcept {
+    const auto globalValue = query_device_uint32(deviceID, selector, kAudioObjectPropertyScopeGlobal);
+    if (globalValue != AVAudioTelemetry::unknown_value) {
+      return globalValue;
+    }
+    return query_device_uint32(deviceID, selector, kAudioDevicePropertyScopeInput);
+  }
+
+  /**
+   * @brief Update Core Audio callback counters from the realtime callback.
+   */
+  void record_io_callback(AVAudioTelemetry *telemetry, std::uint64_t callbackHostTime, const AudioBufferList *inputData, UInt32 inputFrames, bool inputValid, const AudioTimeStamp *inputTime) noexcept {
+    telemetry->callbackCount.fetch_add(1, std::memory_order_relaxed);
+
+    const UInt32 bufferCount = inputData ? inputData->mNumberBuffers : 0;
+    atomic_max(telemetry->callbackMaxBufferCount, bufferCount);
+
+    if (inputData && bufferCount > 0) {
+      const AudioBuffer &firstBuffer = inputData->mBuffers[0];
+      atomic_max(telemetry->callbackMaxBufferBytes, firstBuffer.mDataByteSize);
+    }
+
+    if (inputValid) {
+      telemetry->callbackFrames.fetch_add(inputFrames, std::memory_order_relaxed);
+      atomic_min(telemetry->callbackMinFrames, inputFrames);
+      atomic_max(telemetry->callbackMaxFrames, inputFrames);
+    } else {
+      telemetry->callbackInvalidCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const auto previousCallbackHostTime = telemetry->lastCallbackHostTime.exchange(callbackHostTime, std::memory_order_relaxed);
+    if (previousCallbackHostTime != 0 && callbackHostTime >= previousCallbackHostTime) {
+      const auto period = callbackHostTime - previousCallbackHostTime;
+      telemetry->callbackPeriodCount.fetch_add(1, std::memory_order_relaxed);
+      telemetry->callbackPeriodTicks.fetch_add(period, std::memory_order_relaxed);
+      atomic_max(telemetry->callbackMaxPeriodTicks, period);
+    }
+
+    if (inputTime && (inputTime->mFlags & kAudioTimeStampHostTimeValid) && inputTime->mHostTime != 0) {
+      if (callbackHostTime >= inputTime->mHostTime) {
+        const auto age = callbackHostTime - inputTime->mHostTime;
+        telemetry->timestampAgeCount.fetch_add(1, std::memory_order_relaxed);
+        atomic_max(telemetry->timestampMaxAgeTicks, age);
+      } else {
+        telemetry->timestampFutureCount.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  /**
+   * @brief Produce PCM bytes and collect lock-free producer diagnostics.
+   */
+  bool produce_audio_bytes(AVAudio *avAudio, AVAudioTelemetry *telemetry, const void *source, UInt32 bytes, bool telemetryActive) noexcept {
+    const bool produced = TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, source, bytes);
+    if (!telemetry || !telemetryActive) {
+      return produced;
+    }
+
+    if (produced) {
+      telemetry->producerWriteCount.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      telemetry->producerDropCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return produced;
+  }
+}
 
 namespace platf {
   using namespace std::literals;
@@ -118,6 +309,29 @@ namespace platf {
     UInt32 clientChannels = procData->clientRequestedChannels;
     UInt32 clientFrameSize = procData->clientRequestedFrameSize;
     AVAudio *avAudio = procData->avAudio;
+    AVAudioTelemetry *telemetry = procData->telemetry;
+
+    std::uint64_t callbackHostTime = 0;
+    bool telemetryActive = false;
+    if (telemetry && telemetry->collecting.load(std::memory_order_acquire)) {
+      callbackHostTime = mach_absolute_time();
+      telemetryActive = telemetry_is_active(telemetry, callbackHostTime);
+    }
+
+    UInt32 inputFrames = 0;
+    bool inputValid = false;
+    if (inInputData && inInputData->mNumberBuffers > 0) {
+      const AudioBuffer &inputBuffer = inInputData->mBuffers[0];
+      const UInt32 deviceChannels = procData->aggregateDeviceChannels;
+      if (inputBuffer.mData && inputBuffer.mDataByteSize > 0 && deviceChannels > 0) {
+        inputFrames = inputBuffer.mDataByteSize / (deviceChannels * sizeof(float));
+        inputValid = inputFrames > 0;
+      }
+    }
+
+    if (telemetryActive) {
+      record_io_callback(telemetry, callbackHostTime, inInputData, inputFrames, inputValid, inInputTime);
+    }
 
     // Always ensure we write to buffer and signal, even if input is empty/invalid
     bool didWriteData = false;
@@ -125,10 +339,9 @@ namespace platf {
     if (inInputData && inInputData->mNumberBuffers > 0) {
       AudioBuffer inputBuffer = inInputData->mBuffers[0];
 
-      if (inputBuffer.mData && inputBuffer.mDataByteSize > 0) {
+      if (inputValid) {
         auto *inputSamples = static_cast<float *>(inputBuffer.mData);
         UInt32 deviceChannels = procData->aggregateDeviceChannels;
-        UInt32 inputFrames = inputBuffer.mDataByteSize / (deviceChannels * sizeof(float));
 
         // Use AudioConverter if we need any conversion, otherwise pass through
         if (procData->audioConverter) {
@@ -162,16 +375,16 @@ namespace platf {
           if (converterStatus == noErr && outputFrameCount > 0) {
             // AudioConverter did all the work: sample rate + channels + optimal frame count
             UInt32 actualOutputBytes = outputFrameCount * clientChannels * sizeof(float);
-            TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, procData->conversionBuffer, actualOutputBytes);
+            produce_audio_bytes(avAudio, telemetry, procData->conversionBuffer, actualOutputBytes, telemetryActive);
             didWriteData = true;
           } else {
             // Fallback: write original data
-            TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, inputBuffer.mData, inputBuffer.mDataByteSize);
+            produce_audio_bytes(avAudio, telemetry, inputBuffer.mData, inputBuffer.mDataByteSize, telemetryActive);
             didWriteData = true;
           }
         } else {
           // No conversion needed - direct passthrough
-          TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, inputBuffer.mData, inputBuffer.mDataByteSize);
+          produce_audio_bytes(avAudio, telemetry, inputBuffer.mData, inputBuffer.mDataByteSize, telemetryActive);
           didWriteData = true;
         }
       }
@@ -190,7 +403,7 @@ namespace platf {
 
         // Creating actual silence
         memset(procData->conversionBuffer, 0, silenceBytes);
-        TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, procData->conversionBuffer, silenceBytes);
+        produce_audio_bytes(avAudio, telemetry, procData->conversionBuffer, silenceBytes, telemetryActive);
       } else {
         // Fallback to small stack-allocated buffer for cases without conversion buffer
         float silenceBuffer[512 * 8] = {0};  // Max 512 frames, 8 channels on stack
@@ -198,7 +411,7 @@ namespace platf {
         silenceFrames = std::min(silenceFrames, maxStackFrames);
         UInt32 silenceBytes = silenceFrames * clientChannels * sizeof(float);
 
-        TPCircularBufferProduceBytes(&avAudio->audioSampleBuffer, silenceBuffer, silenceBytes);
+        produce_audio_bytes(avAudio, telemetry, silenceBuffer, silenceBytes, telemetryActive);
       }
     }
 
@@ -340,6 +553,7 @@ namespace platf {
 
   // Initialize buffer and signal
   [self initializeAudioBuffer:channels];
+  [self configureAudioTelemetry:sampleRate frameSize:frameSize channels:channels];
   BOOST_LOG(debug) << "Audio buffer initialized for microphone capture"sv;
 
   [self.audioCaptureSession startRunning];
@@ -374,7 +588,12 @@ namespace platf {
     // and we don't want to do sanity checks in a performance critical exec path
     AudioBuffer audioBuffer = audioBufferList.mBuffers[0];
 
-    TPCircularBufferProduceBytes(&self->audioSampleBuffer, audioBuffer.mData, audioBuffer.mDataByteSize);
+    auto *telemetry = self->audioTelemetry;
+    bool telemetryActive = false;
+    if (telemetry && telemetry->collecting.load(std::memory_order_acquire)) {
+      telemetryActive = telemetry_is_active(telemetry, mach_absolute_time());
+    }
+    produce_audio_bytes(self, telemetry, audioBuffer.mData, audioBuffer.mDataByteSize, telemetryActive);
     dispatch_semaphore_signal(self->audioSemaphore);
   }
 }
@@ -411,6 +630,7 @@ namespace platf {
 
   // 5. Initialize buffer and signal
   [self initializeAudioBuffer:channels];
+  [self configureAudioTelemetry:sampleRate frameSize:frameSize channels:channels];
 
   // 6. Create and start IOProc
   OSStatus ioProcStatus = [self createAndStartAggregateDeviceIOProc:tapDescription];
@@ -519,6 +739,12 @@ namespace platf {
   using namespace std::literals;
   BOOST_LOG(debug) << "Initializing audio buffer for "sv << (int) channels << " channels"sv;
 
+  if (self->audioTelemetry) {
+    [self reportAudioTelemetryIfDue:YES];
+    delete self->audioTelemetry;
+    self->audioTelemetry = nullptr;
+  }
+
   // Cleanup any existing circular buffer first
   TPCircularBufferCleanup(&self->audioSampleBuffer);
 
@@ -533,13 +759,146 @@ namespace platf {
     dispatch_release(self->audioSemaphore);
   }
   self->audioSemaphore = dispatch_semaphore_create(0);
+  self->audioTelemetry = new (std::nothrow) AVAudioTelemetry {};
 
   BOOST_LOG(debug) << "Audio buffer initialized successfully with size: "sv << ringBufferSize << " bytes"sv;
+}
+
+- (void)refreshAudioTelemetryDeviceProperties {
+  if (!self->ioProcData || self->aggregateDeviceID == kAudioObjectUnknown) {
+    return;
+  }
+
+  auto *procData = self->ioProcData;
+  const auto sampleRate = query_device_float64(self->aggregateDeviceID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal);
+  if (sampleRate > 0.0) {
+    procData->actualAggregateDeviceSampleRate = sampleRate;
+  }
+
+  procData->actualBufferFrameSize = query_device_uint32_with_input_fallback(self->aggregateDeviceID, kAudioDevicePropertyBufferFrameSize);
+  procData->aggregateLatencyFrames = query_device_uint32_with_input_fallback(self->aggregateDeviceID, kAudioDevicePropertyLatency);
+  procData->aggregateSafetyOffsetFrames = query_device_uint32_with_input_fallback(self->aggregateDeviceID, kAudioDevicePropertySafetyOffset);
+
+  if (self->audioTelemetry) {
+    self->audioTelemetry->aggregateSampleRate = procData->actualAggregateDeviceSampleRate > 0.0 ? procData->actualAggregateDeviceSampleRate : procData->aggregateDeviceSampleRate;
+    self->audioTelemetry->aggregateChannels = procData->aggregateDeviceChannels;
+    self->audioTelemetry->actualBufferFrameSize = procData->actualBufferFrameSize;
+    self->audioTelemetry->aggregateLatencyFrames = procData->aggregateLatencyFrames;
+    self->audioTelemetry->aggregateSafetyOffsetFrames = procData->aggregateSafetyOffsetFrames;
+  }
+}
+
+- (void)configureAudioTelemetry:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels {
+  if (!self->audioTelemetry) {
+    return;
+  }
+
+  if (self->ioProcData) {
+    [self refreshAudioTelemetryDeviceProperties];
+  }
+
+  auto *telemetry = self->audioTelemetry;
+  telemetry->requestedSampleRate = sampleRate;
+  telemetry->requestedFrameSize = frameSize;
+  telemetry->requestedChannels = channels;
+  if (self->ioProcData) {
+    telemetry->aggregateSampleRate = self->ioProcData->actualAggregateDeviceSampleRate > 0.0 ? self->ioProcData->actualAggregateDeviceSampleRate : self->ioProcData->aggregateDeviceSampleRate;
+    telemetry->aggregateChannels = self->ioProcData->aggregateDeviceChannels;
+    telemetry->actualBufferFrameSize = self->ioProcData->actualBufferFrameSize;
+    telemetry->aggregateLatencyFrames = self->ioProcData->aggregateLatencyFrames;
+    telemetry->aggregateSafetyOffsetFrames = self->ioProcData->aggregateSafetyOffsetFrames;
+    self->ioProcData->telemetry = telemetry;
+  }
+
+  telemetry->startHostTime = mach_absolute_time();
+  telemetry->deadlineHostTime = telemetry->startHostTime + host_ticks_for_seconds(AVAudioTelemetry::window_seconds);
+  telemetry->reported.store(false, std::memory_order_relaxed);
+  telemetry->collecting.store(sampleRate > 0 && frameSize > 0 && channels > 0, std::memory_order_release);
+
+  const auto format_value = [](UInt32 value) {
+    return value == AVAudioTelemetry::unknown_value ? std::string("unknown") : std::to_string(value);
+  };
+  BOOST_LOG(info) << "Audio telemetry armed: requested " << sampleRate << "Hz/" << (int) channels << "ch/" << frameSize << " frames, aggregate "
+                  << telemetry->aggregateSampleRate << "Hz/" << telemetry->aggregateChannels << "ch, buffer "
+                  << format_value(telemetry->actualBufferFrameSize) << " frames, latency "
+                  << format_value(telemetry->aggregateLatencyFrames) << " frames, safety "
+                  << format_value(telemetry->aggregateSafetyOffsetFrames) << " frames";
+}
+
+- (void)recordAudioConsumerAvailableBytes:(UInt32)availableBytes {
+  auto *telemetry = self->audioTelemetry;
+  if (!telemetry || !telemetry_is_active(telemetry, mach_absolute_time())) {
+    return;
+  }
+
+  atomic_max(telemetry->maxObservedFillBytes, availableBytes);
+  if (availableBytes == 0) {
+    telemetry->consumerEmptyCount.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+- (void)recordAudioConsumerWait:(std::uint64_t)waitHostTicks timedOut:(BOOL)timedOut {
+  auto *telemetry = self->audioTelemetry;
+  if (!telemetry || !telemetry_is_active(telemetry, mach_absolute_time())) {
+    return;
+  }
+
+  telemetry->consumerWaitCount.fetch_add(1, std::memory_order_relaxed);
+  if (timedOut) {
+    telemetry->consumerTimeoutCount.fetch_add(1, std::memory_order_relaxed);
+  }
+  atomic_max(telemetry->consumerMaxWaitTicks, waitHostTicks);
+}
+
+- (void)reportAudioTelemetryIfDue:(BOOL)force {
+  auto *telemetry = self->audioTelemetry;
+  if (!telemetry || telemetry->requestedSampleRate == 0) {
+    return;
+  }
+
+  const auto now = mach_absolute_time();
+  const bool due = force || !telemetry->collecting.load(std::memory_order_acquire) || now >= telemetry->deadlineHostTime;
+  if (!due) {
+    return;
+  }
+
+  telemetry->collecting.store(false, std::memory_order_release);
+  bool expected = false;
+  if (!telemetry->reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    return;
+  }
+
+  const auto callbackCount = telemetry->callbackCount.load(std::memory_order_relaxed);
+  const auto invalidCallbackCount = telemetry->callbackInvalidCount.load(std::memory_order_relaxed);
+  const auto validCallbackCount = callbackCount > invalidCallbackCount ? callbackCount - invalidCallbackCount : 0;
+  const auto callbackFrameAverage = validCallbackCount ? telemetry->callbackFrames.load(std::memory_order_relaxed) / validCallbackCount : 0;
+  const auto periodCount = telemetry->callbackPeriodCount.load(std::memory_order_relaxed);
+  const auto timestampCount = telemetry->timestampAgeCount.load(std::memory_order_relaxed);
+  const auto elapsedMicroseconds = now >= telemetry->startHostTime ? host_ticks_to_microseconds(now - telemetry->startHostTime) : 0;
+  const auto format_value = [](UInt32 value) {
+    return value == AVAudioTelemetry::unknown_value ? std::string("unknown") : std::to_string(value);
+  };
+  const auto format_ticks = [](std::uint64_t ticks) {
+    return host_ticks_to_microseconds(ticks);
+  };
+
+  BOOST_LOG(info) << "Audio telemetry (" << elapsedMicroseconds << "us): callbacks=" << callbackCount
+                  << ", input frames min/avg/max=" << format_value(telemetry->callbackMinFrames.load(std::memory_order_relaxed)) << "/" << callbackFrameAverage << "/" << telemetry->callbackMaxFrames.load(std::memory_order_relaxed)
+                  << ", max first buffer bytes=" << telemetry->callbackMaxBufferBytes.load(std::memory_order_relaxed)
+                  << ", buffers max=" << telemetry->callbackMaxBufferCount.load(std::memory_order_relaxed)
+                  << ", invalid=" << invalidCallbackCount
+                  << ", callback period us avg/max=" << (periodCount ? format_ticks(telemetry->callbackPeriodTicks.load(std::memory_order_relaxed) / periodCount) : 0) << "/" << (periodCount ? format_ticks(telemetry->callbackMaxPeriodTicks.load(std::memory_order_relaxed)) : 0)
+                  << ", input timestamp age max=" << (timestampCount ? format_ticks(telemetry->timestampMaxAgeTicks.load(std::memory_order_relaxed)) : 0) << "us (valid=" << timestampCount << ", future=" << telemetry->timestampFutureCount.load(std::memory_order_relaxed) << ")"
+                  << ", ring fill max=" << telemetry->maxObservedFillBytes.load(std::memory_order_relaxed) << " bytes, writes/drops=" << telemetry->producerWriteCount.load(std::memory_order_relaxed) << "/" << telemetry->producerDropCount.load(std::memory_order_relaxed)
+                  << ", consumer empty/waits/timeouts=" << telemetry->consumerEmptyCount.load(std::memory_order_relaxed) << "/" << telemetry->consumerWaitCount.load(std::memory_order_relaxed) << "/" << telemetry->consumerTimeoutCount.load(std::memory_order_relaxed)
+                  << ", consumer wait max=" << format_ticks(telemetry->consumerMaxWaitTicks.load(std::memory_order_relaxed)) << "us";
 }
 
 - (void)cleanupAudioBuffer {
   using namespace std::literals;
   BOOST_LOG(debug) << "Cleaning up audio buffer"sv;
+
+  [self reportAudioTelemetryIfDue:YES];
 
   // Signal any waiting threads before cleanup and release semaphore
   if (self->audioSemaphore) {
@@ -550,6 +909,9 @@ namespace platf {
 
   // Cleanup the circular buffer
   TPCircularBufferCleanup(&self->audioSampleBuffer);
+
+  delete self->audioTelemetry;
+  self->audioTelemetry = nullptr;
 
   BOOST_LOG(debug) << "Audio buffer cleanup completed"sv;
 }
@@ -608,9 +970,16 @@ namespace platf {
   }
 
   self->ioProcData->avAudio = self;
+  self->ioProcData->telemetry = NULL;
   self->ioProcData->clientRequestedChannels = channels;
   self->ioProcData->clientRequestedFrameSize = frameSize;
   self->ioProcData->clientRequestedSampleRate = sampleRate;
+  self->ioProcData->aggregateDeviceSampleRate = sampleRate;
+  self->ioProcData->aggregateDeviceChannels = channels;
+  self->ioProcData->actualAggregateDeviceSampleRate = 0.0;
+  self->ioProcData->actualBufferFrameSize = AVAudioTelemetry::unknown_value;
+  self->ioProcData->aggregateLatencyFrames = AVAudioTelemetry::unknown_value;
+  self->ioProcData->aggregateSafetyOffsetFrames = AVAudioTelemetry::unknown_value;
   self->ioProcData->audioConverter = NULL;
   self->ioProcData->conversionBuffer = NULL;
   self->ioProcData->conversionBufferSize = 0;
@@ -859,6 +1228,7 @@ namespace platf {
   // Store the actual device format for use in the IOProc
   self->ioProcData->aggregateDeviceSampleRate = aggregateDeviceSampleRate;
   self->ioProcData->aggregateDeviceChannels = aggregateDeviceChannels;
+  self->ioProcData->actualAggregateDeviceSampleRate = aggregateDeviceSampleRate;
 
   BOOST_LOG(debug) << "Device properties and converter configuration completed"sv;
   return noErr;
