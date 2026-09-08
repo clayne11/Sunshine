@@ -38,6 +38,7 @@ target_link_libraries(vd_helper PRIVATE
         "-framework Foundation"
         "-framework AppKit"
         "-framework CoreGraphics"
+        "-framework IOKit"
         "-F/System/Library/PrivateFrameworks"
         "-framework SkyLight")
 add_dependencies(sunshine vd_helper)

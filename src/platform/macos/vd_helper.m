@@ -15,12 +15,14 @@
  * Compiled with ARC (-fobjc-arc).
  */
 #include "display_preferences.h"
+#include "vd_helper_policy.h"
 #include "vd_spawn.h"
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <errno.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,6 +45,58 @@ extern char **environ;
  * @return The initialized mode.
  */
 - (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate;
+@end
+
+/**
+ * @brief Scoped assertion that prevents display sleep during helper work.
+ */
+@interface VDDisplayPowerGuard: NSObject {
+@private
+  IOPMAssertionID _assertionID;  ///< Assertion released when the guard leaves scope.
+}
+
+/**
+ * @brief Create a display-sleep prevention assertion.
+ * @param reason Human-readable assertion reason.
+ * @return Initialized guard, or nil when macOS rejects the assertion.
+ */
+- (instancetype)initWithReason:(NSString *)reason;
+@end
+
+@implementation VDDisplayPowerGuard
+
+- (instancetype)initWithReason:(NSString *)reason {
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+
+  _assertionID = kIOPMNullAssertionID;
+  const IOReturn result = IOPMAssertionCreateWithName(
+    kIOPMAssertPreventUserIdleDisplaySleep,
+    kIOPMAssertionLevelOn,
+    (__bridge CFStringRef) reason,
+    &_assertionID
+  );
+  if (result != kIOReturnSuccess) {
+    fprintf(stderr, "[vd_helper] Could not prevent display sleep: 0x%x\n", result);
+    return nil;
+  }
+  return self;
+}
+
+/**
+ * @brief Release the display-sleep prevention assertion.
+ */
+- (void)dealloc {
+  if (_assertionID != kIOPMNullAssertionID) {
+    const IOReturn result = IOPMAssertionRelease(_assertionID);
+    if (result != kIOReturnSuccess) {
+      fprintf(stderr, "[vd_helper] Could not release display-sleep assertion %u: 0x%x\n", _assertionID, result);
+    }
+  }
+}
+
 @end
 
 /** @brief Settings applied to a private CGVirtualDisplay. */
@@ -122,9 +176,9 @@ static CGVirtualDisplayDescriptor *keepDesc = nil;
 
 static volatile sig_atomic_t shouldExit = 0;  ///< Set by the async-safe signal handler.
 static pid_t originalParentPID = 0;  ///< Direct parent's PID captured before setup.
-static CGDirectDisplayID originalDisplayIDs[64];  ///< Displays active before creation.
+static CGDirectDisplayID originalDisplayIDs[64];  ///< Ordinary displays active before creation.
 static uint32_t originalDisplayCount = 0;  ///< Number of saved display IDs.
-static CGDirectDisplayID originalOnlineDisplayIDs[64];  ///< All physical displays online before creation.
+static CGDirectDisplayID originalOnlineDisplayIDs[64];  ///< Ordinary displays online before creation.
 static uint32_t originalOnlineDisplayCount = 0;  ///< Number of saved online display IDs.
 static BOOL exclusiveApplied = NO;  ///< Whether physical displays were disabled.
 
@@ -193,6 +247,70 @@ static BOOL checkDisplayInList(uint32_t targetID, uint32_t *outCount) {
 }
 
 /**
+ * @brief Identify a known transient virtual display seen during recovery.
+ *
+ * Recovery probes identified the exact vendor/model pairs `unkn`/`virt` for
+ * the macOS fallback and `F0F0`/`5678` for an orphaned Sunshine display.
+ * Ordinary physical displays and all other virtual displays are retained.
+ *
+ * @param displayID Display identifier to classify.
+ * @return YES only for one of the observed transient virtual-display signatures.
+ */
+static BOOL isKnownTransientVirtualDisplay(CGDirectDisplayID displayID) {
+  return vd_helper_is_known_transient_virtual_display(CGDisplayVendorNumber(displayID), CGDisplayModelNumber(displayID));
+}
+
+/**
+ * @brief Check whether WindowServer currently reports an ordinary active display.
+ * @return YES when at least one active display is not a known transient virtual display.
+ */
+static BOOL ordinaryDisplayIsActive(void) {
+  CGDirectDisplayID activeDisplays[64];
+  uint32_t displayCount = 0;
+  if (CGGetActiveDisplayList(64, activeDisplays, &displayCount) != kCGErrorSuccess) {
+    return NO;
+  }
+  for (uint32_t index = 0; index < displayCount; ++index) {
+    if (!isKnownTransientVirtualDisplay(activeDisplays[index])) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+/**
+ * @brief Wake the display system before taking the guardian's physical snapshot.
+ *
+ * User activity is declared unconditionally because macOS can report a
+ * fallback or orphaned virtual display as active while the physical display is
+ * asleep. The bounded wait permits a physical display to reappear without
+ * preventing a genuinely headless host from continuing.
+ */
+static void wakeDisplayBeforeSnapshot(void) {
+  IOPMAssertionID activityAssertionID = kIOPMNullAssertionID;
+  const IOReturn result = IOPMAssertionDeclareUserActivity(
+    CFSTR("Sunshine virtual display setup"),
+    kIOPMUserActiveRemote,
+    &activityAssertionID
+  );
+  if (result != kIOReturnSuccess) {
+    fprintf(stderr, "[vd_helper] Could not declare remote user activity: 0x%x\n", result);
+    return;
+  }
+
+  static const unsigned int attempts = 10;
+  static const CFTimeInterval interval = 0.05;
+  for (unsigned int attempt = 0; attempt < attempts && !ordinaryDisplayIsActive(); ++attempt) {
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, interval, false);
+  }
+
+  const IOReturn releaseResult = IOPMAssertionRelease(activityAssertionID);
+  if (releaseResult != kIOReturnSuccess) {
+    fprintf(stderr, "[vd_helper] Could not release user-activity assertion %u: 0x%x\n", activityAssertionID, releaseResult);
+  }
+}
+
+/**
  * @brief Wait for WindowServer to expose an online, active display.
  * @param displayID Display identifier to inspect.
  * @return YES when the display is ready before the bounded deadline.
@@ -225,6 +343,17 @@ static BOOL captureOriginalDisplays(void) {
     originalDisplayCount = 0;
     return NO;
   }
+  uint32_t filteredActiveCount = 0;
+  for (uint32_t index = 0; index < originalDisplayCount; ++index) {
+    const CGDirectDisplayID displayID = originalDisplayIDs[index];
+    if (isKnownTransientVirtualDisplay(displayID)) {
+      fprintf(stderr, "[vd_helper] Ignoring transient virtual display %u in active snapshot\n", displayID);
+      continue;
+    }
+    originalDisplayIDs[filteredActiveCount++] = displayID;
+  }
+  originalDisplayCount = filteredActiveCount;
+
   error = CGGetOnlineDisplayList(64, originalOnlineDisplayIDs, &originalOnlineDisplayCount);
   if (error != kCGErrorSuccess) {
     fprintf(stderr, "[vd_helper] Could not snapshot online displays: %d\n", error);
@@ -232,6 +361,16 @@ static BOOL captureOriginalDisplays(void) {
     originalOnlineDisplayCount = 0;
     return NO;
   }
+  uint32_t filteredOnlineCount = 0;
+  for (uint32_t index = 0; index < originalOnlineDisplayCount; ++index) {
+    const CGDirectDisplayID displayID = originalOnlineDisplayIDs[index];
+    if (isKnownTransientVirtualDisplay(displayID)) {
+      fprintf(stderr, "[vd_helper] Ignoring transient virtual display %u in online snapshot\n", displayID);
+      continue;
+    }
+    originalOnlineDisplayIDs[filteredOnlineCount++] = displayID;
+  }
+  originalOnlineDisplayCount = filteredOnlineCount;
   return YES;
 }
 
@@ -243,10 +382,10 @@ static BOOL captureOriginalDisplays(void) {
 static BOOL onlyVirtualDisplayActive(CGDirectDisplayID virtualID) {
   CGDirectDisplayID activeDisplays[64];
   uint32_t displayCount = 0;
-  if (CGGetActiveDisplayList(64, activeDisplays, &displayCount) != kCGErrorSuccess || displayCount != 1) {
+  if (CGGetActiveDisplayList(64, activeDisplays, &displayCount) != kCGErrorSuccess) {
     return NO;
   }
-  return activeDisplays[0] == virtualID;
+  return vd_helper_active_list_is_only_target(activeDisplays, displayCount, virtualID);
 }
 
 /**
@@ -279,7 +418,7 @@ static BOOL originalDisplaysAreActive(CGDirectDisplayID virtualID) {
 
   uint32_t remainingCount = 0;
   for (uint32_t activeIndex = 0; activeIndex < displayCount; ++activeIndex) {
-    if (activeDisplays[activeIndex] == virtualID) {
+    if (activeDisplays[activeIndex] == virtualID || isKnownTransientVirtualDisplay(activeDisplays[activeIndex])) {
       continue;
     }
     if (!displayIDIsInList(originalDisplayIDs, originalDisplayCount, activeDisplays[activeIndex])) {
@@ -328,6 +467,18 @@ static BOOL waitForOriginalDisplays(CGDirectDisplayID virtualID) {
  * @return YES when the restoration matches the saved physical display set.
  */
 static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID, CGConfigureOption option) {
+  // When no ordinary display was captured, the filtered snapshot represents a
+  // headless or transient-only baseline.  Avoid an empty transaction in that
+  // case, while retaining the transaction for every physical baseline so a
+  // stale CoreGraphics active-list cache cannot hide a missing display.
+  if (originalDisplayCount == 0 && originalOnlineDisplayCount == 0) {
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    if (originalDisplaysAreActive(virtualID)) {
+      fprintf(stderr, "[vd_helper] No ordinary display state requires restoration; skipping empty transaction\n");
+      return YES;
+    }
+  }
+
   CGDisplayConfigRef config = NULL;
   CGError error = CGBeginDisplayConfiguration(&config);
   if (error != kCGErrorSuccess || !config) {
@@ -410,6 +561,16 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   if (!waitForDisplayReady(virtualID)) {
     fprintf(stderr, "[vd_helper] Virtual display %u is not ready; keeping physical displays enabled\n", virtualID);
     return NO;
+  }
+
+  // A previous cleanup or WindowServer transition may already have left the
+  // requested strict virtual-only state.  Do not reopen a configuration just
+  // to disable physical displays that are already inactive.
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+  if (onlyVirtualDisplayActive(virtualID)) {
+    fprintf(stderr, "[vd_helper] Exclusive display state is already active; skipping configuration transaction\n");
+    exclusiveApplied = YES;
+    return YES;
   }
 
   CGDisplayConfigRef config = NULL;
@@ -910,6 +1071,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       return 1;
     }
 
+    __attribute__((objc_precise_lifetime)) VDDisplayPowerGuard *displayPowerGuard = request.exclusive ? [[VDDisplayPowerGuard alloc] initWithReason:@"Sunshine exclusive virtual display holder"] : nil;
+    (void) displayPowerGuard;
+
     if (request.exclusive && !captureOriginalDisplays()) {
       fprintf(stdout, "0\n");
       fflush(stdout);
@@ -1302,9 +1466,14 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
     writeGuardianDisplayID(0);
     return 1;
   }
-  if (request.exclusive && !captureOriginalDisplays()) {
-    writeGuardianDisplayID(0);
-    return 1;
+  __attribute__((objc_precise_lifetime)) VDDisplayPowerGuard *displayPowerGuard = request.exclusive ? [[VDDisplayPowerGuard alloc] initWithReason:@"Sunshine exclusive virtual display guardian"] : nil;
+  (void) displayPowerGuard;
+  if (request.exclusive) {
+    wakeDisplayBeforeSnapshot();
+    if (!captureOriginalDisplays()) {
+      writeGuardianDisplayID(0);
+      return 1;
+    }
   }
 
   int pipefd[2];

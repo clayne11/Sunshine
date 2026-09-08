@@ -38,6 +38,17 @@ Retained capabilities:
   restoration. Helper spawning
   closes unrelated file descriptors so it cannot retain the server's listening
   sockets.
+- Exclude the observed macOS fallback and stale Sunshine virtual-display
+  signatures from saved physical-display snapshots. WindowServer may replace
+  those IDs during headless startup, making them invalid hardware enablement
+  targets. Skip exclusive configuration only when the requested display is
+  already the exact sole active display; other active displays still prevent
+  success. An empty physical baseline needs no restoration transaction.
+- Hold independent display-sleep prevention assertions in the virtual-display
+  supervisor and holder throughout exclusive setup and restoration. Before the
+  supervisor snapshots physical displays, declare remote user activity and
+  wait up to 500 milliseconds for an ordinary display to reappear; continue
+  after the bound so genuinely headless hosts remain supported.
 - Use the supervisor/holder pair to recover when either process dies alone.
   The supervisor has its own process group so launchd can restart Sunshine
   without killing display recovery. Recovery after both helper processes die
