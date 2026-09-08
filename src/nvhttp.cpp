@@ -12,7 +12,9 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 // lib includes
@@ -106,6 +108,88 @@ namespace nvhttp {
     return mutex;
   }
 
+  namespace {
+    /**
+     * @brief Authenticated identity bound to one live GameStream HTTPS connection.
+     */
+    struct verified_client_t {
+      std::string cert;  ///< Canonical PEM certificate presented by the paired client.
+      std::string name;  ///< Friendly name stored for the paired client.
+    };
+
+    /**
+     * @brief Build an unambiguous process-local key for a TCP connection endpoint.
+     * @param endpoint Remote address and ephemeral port of the TLS connection.
+     * @return Stable key for the lifetime of that TCP connection.
+     */
+    std::string endpoint_key(const boost::asio::ip::tcp::endpoint &endpoint) {
+      return endpoint.address().to_string() + "#" + std::to_string(endpoint.port());
+    }
+
+    /**
+     * @brief Associate verified clients with their exact live TLS connections.
+     */
+    class verified_client_registry_t {
+    public:
+      /**
+       * @brief Register an authenticated connection until the returned token is released.
+       * @param endpoint Remote endpoint of the accepted TLS connection.
+       * @param client Verified paired-client identity.
+       * @return Token retained by the connection socket for its complete lifetime.
+       */
+      std::shared_ptr<void> remember(const boost::asio::ip::tcp::endpoint &endpoint, verified_client_t client) {
+        auto record = std::make_shared<verified_client_t>(std::move(client));
+        std::lock_guard lock {mutex_};
+        std::erase_if(records_, [](const auto &entry) {
+          return entry.second.expired();
+        });
+        records_[endpoint_key(endpoint)] = record;
+        return record;
+      }
+
+      /**
+       * @brief Look up the identity bound to an active TLS connection.
+       * @param endpoint Remote endpoint of the request's existing connection.
+       * @return Verified identity, or no value when the connection is not registered.
+       */
+      std::optional<verified_client_t> find(const boost::asio::ip::tcp::endpoint &endpoint) {
+        std::lock_guard lock {mutex_};
+        const auto key = endpoint_key(endpoint);
+        const auto entry = records_.find(key);
+        if (entry == records_.end()) {
+          return std::nullopt;
+        }
+        auto record = entry->second.lock();
+        if (!record) {
+          records_.erase(entry);
+          return std::nullopt;
+        }
+        return *record;
+      }
+
+      /**
+       * @brief Remove all registered connection identities during tests.
+       */
+      void clear() {
+        std::lock_guard lock {mutex_};
+        records_.clear();
+      }
+
+    private:
+      std::mutex mutex_;  ///< Serializes handshake registration and request lookup.
+      std::unordered_map<std::string, std::weak_ptr<verified_client_t>> records_;  ///< Live identities keyed by exact TCP endpoint.
+    };
+
+    /**
+     * @brief Return the process-wide verified connection registry.
+     * @return Registry shared by TLS handshakes and HTTPS request handlers.
+     */
+    verified_client_registry_t &verified_client_registry() {
+      static verified_client_registry_t registry;
+      return registry;
+    }
+  }  // namespace
+
   /**
    * @brief HTTPS server backend that adds Sunshine's client-certificate verification.
    */
@@ -127,7 +211,7 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-    std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
+    std::function<std::optional<verified_client_t>(SSL *)> verify;  ///< Callback that validates and identifies a TLS client.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
@@ -178,11 +262,18 @@ namespace nvhttp {
               return;
             }
             if (!ec) {
-              if (verify && !verify(session->connection->socket->native_handle())) {
-                this->write(session, on_verify_failed);
-              } else {
-                this->read(session);
+              if (verify) {
+                auto verified_client = verify(session->connection->socket->native_handle());
+                if (!verified_client) {
+                  this->write(session, on_verify_failed);
+                  return;
+                }
+                session->connection->socket->verified_client_registration = verified_client_registry().remember(
+                  session->request->remote_endpoint(),
+                  std::move(*verified_client)
+                );
               }
+              this->read(session);
             } else if (this->on_error) {
               this->on_error(session->request, ec);
             }
@@ -243,10 +334,6 @@ namespace nvhttp {
 
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
-
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
-  std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -510,9 +597,14 @@ namespace nvhttp {
    *
    * @param host_audio Host audio.
    * @param args Arguments forwarded to the callable or parser.
+   * @param verified_client Authenticated identity bound to the current TLS connection.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(
+    bool host_audio,
+    const args_t &args,
+    const verified_client_t &verified_client
+  ) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -556,8 +648,8 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    launch_session->client_cert = verified_client.cert;
+    launch_session->client_name = verified_client.name;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
@@ -1353,6 +1445,13 @@ namespace nvhttp {
     });
 
     auto args = request->parse_query_string();
+    const auto verified_client = verified_client_registry().find(request->remote_endpoint());
+    if (!verified_client) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "Authenticated client identity is unavailable for this HTTPS connection");
+      return;
+    }
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args) ||
@@ -1378,7 +1477,7 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, *verified_client);
 
     const bool no_active_sessions = rtsp_stream::session_count() == 0;
     if (no_active_sessions) {
@@ -1504,6 +1603,13 @@ namespace nvhttp {
     }
 
     auto args = request->parse_query_string();
+    const auto verified_client = verified_client_registry().find(request->remote_endpoint());
+    if (!verified_client) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 401);
+      tree.put("root.<xmlattr>.status_message", "Authenticated client identity is unavailable for this HTTPS connection");
+      return;
+    }
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args)
@@ -1522,7 +1628,8 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, *verified_client);
+
 
     if (no_active_sessions) {
       if (!display_device::reserve_virtual_display(config::video, launch_session->id)) {
@@ -1687,7 +1794,7 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [](SSL *ssl) {
+    https_server.verify = [](SSL *ssl) -> std::optional<verified_client_t> {
       crypto::x509_t x509 {
 #if OPENSSL_VERSION_MAJOR >= 3
         SSL_get1_peer_certificate(ssl)
@@ -1697,10 +1804,10 @@ namespace nvhttp {
       };
       if (!x509) {
         BOOST_LOG(info) << "unknown -- denied"sv;
-        return 0;
+        return std::nullopt;
       }
 
-      int verified = 0;
+      bool verified = false;
 
       auto fg = util::fail_guard([&]() {
         char subject_name[256];
@@ -1715,7 +1822,7 @@ namespace nvhttp {
       if (err_str) {
         BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
 
-        return verified;
+        return std::nullopt;
       }
 
       // Check if this client is enabled
@@ -1723,14 +1830,12 @@ namespace nvhttp {
       auto [enabled, client_name] = get_client_status(pem);
       if (!enabled) {
         BOOST_LOG(info) << "Client is disabled -- denied"sv;
-        return verified;
+        return std::nullopt;
       }
 
-      last_verified_client_cert = pem;
-      last_verified_client_name = client_name;
-      verified = 1;
+      verified = true;
 
-      return verified;
+      return verified_client_t {std::move(pem), std::move(client_name)};
     };
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
@@ -1882,6 +1987,7 @@ namespace nvhttp {
       std::lock_guard lock {client_auth_mutex()};
       client_root = {};
       cert_chain.clear();
+      verified_client_registry().clear();
     }
 
     std::string add_client(const std::string &name, std::string cert, bool enabled) {
@@ -1900,6 +2006,24 @@ namespace nvhttp {
 
       std::lock_guard lock {client_auth_mutex()};
       return verify_client_certificate(certificate.get()) == nullptr;
+    }
+
+    std::shared_ptr<void> register_verified_client(
+      const boost::asio::ip::tcp::endpoint &endpoint,
+      std::string cert,
+      std::string name
+    ) {
+      return verified_client_registry().remember(endpoint, verified_client_t {std::move(cert), std::move(name)});
+    }
+
+    std::optional<std::pair<std::string, std::string>> verified_client(
+      const boost::asio::ip::tcp::endpoint &endpoint
+    ) {
+      const auto client = verified_client_registry().find(endpoint);
+      if (!client) {
+        return std::nullopt;
+      }
+      return std::pair {client->cert, client->name};
     }
 
     void reload_client_state() {

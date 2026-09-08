@@ -162,3 +162,50 @@ TEST_F(ClientAuthorizationTest, ConcurrentStateChangesRemainConsistent) {
   ASSERT_TRUE(nvhttp::set_client_enabled(uuid, false));
   EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
 }
+
+TEST_F(ClientAuthorizationTest, KeepsVerifiedIdentityScopedToLiveTlsConnection) {
+  const boost::asio::ip::tcp::endpoint first_endpoint {
+    boost::asio::ip::make_address("192.0.2.10"),
+    41000
+  };
+  const boost::asio::ip::tcp::endpoint second_endpoint {
+    boost::asio::ip::make_address("192.0.2.10"),
+    41001
+  };
+
+  auto first_registration = nvhttp::test_support::register_verified_client(first_endpoint, "first-certificate", "first client");
+  auto second_registration = nvhttp::test_support::register_verified_client(second_endpoint, "second-certificate", "second client");
+
+  ASSERT_TRUE(nvhttp::test_support::verified_client(first_endpoint));
+  EXPECT_EQ(nvhttp::test_support::verified_client(first_endpoint)->first, "first-certificate");
+  EXPECT_EQ(nvhttp::test_support::verified_client(first_endpoint)->second, "first client");
+  ASSERT_TRUE(nvhttp::test_support::verified_client(second_endpoint));
+  EXPECT_EQ(nvhttp::test_support::verified_client(second_endpoint)->first, "second-certificate");
+  EXPECT_EQ(nvhttp::test_support::verified_client(second_endpoint)->second, "second client");
+
+  first_registration.reset();
+  EXPECT_FALSE(nvhttp::test_support::verified_client(first_endpoint));
+  EXPECT_TRUE(nvhttp::test_support::verified_client(second_endpoint));
+
+  second_registration.reset();
+  EXPECT_FALSE(nvhttp::test_support::verified_client(second_endpoint));
+}
+
+TEST_F(ClientAuthorizationTest, NewTlsConnectionGenerationReplacesReusedEndpointIdentity) {
+  const boost::asio::ip::tcp::endpoint endpoint {
+    boost::asio::ip::make_address("198.51.100.7"),
+    42000
+  };
+  auto old_registration = nvhttp::test_support::register_verified_client(endpoint, "old-certificate", "old client");
+  auto new_registration = nvhttp::test_support::register_verified_client(endpoint, "new-certificate", "new client");
+
+  ASSERT_TRUE(nvhttp::test_support::verified_client(endpoint));
+  EXPECT_EQ(nvhttp::test_support::verified_client(endpoint)->first, "new-certificate");
+
+  old_registration.reset();
+  ASSERT_TRUE(nvhttp::test_support::verified_client(endpoint));
+  EXPECT_EQ(nvhttp::test_support::verified_client(endpoint)->first, "new-certificate");
+
+  new_registration.reset();
+  EXPECT_FALSE(nvhttp::test_support::verified_client(endpoint));
+}

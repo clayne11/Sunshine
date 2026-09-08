@@ -8,8 +8,11 @@
 // standard includes
 #include <chrono>
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // lib includes
@@ -87,6 +90,8 @@ namespace nvhttp {
    */
   class SunshineHTTPS: public SimpleWeb::HTTPS {
   public:
+    std::shared_ptr<void> verified_client_registration;  ///< Keeps this TLS connection's authenticated identity registered.
+
     /**
      * @brief Construct an HTTPS connection using Sunshine's TLS context.
      *
@@ -385,6 +390,28 @@ namespace nvhttp {
      * @return `true` when the exact certificate belongs to one enabled paired client.
      */
     bool authorize_client_certificate(std::string_view cert);
+
+    /**
+     * @brief Register a test identity for one HTTPS connection endpoint.
+     * @param endpoint Remote endpoint identifying the TLS connection.
+     * @param cert PEM certificate associated with the connection.
+     * @param name Paired-client name associated with the connection.
+     * @return Lifetime token that keeps the endpoint identity registered.
+     */
+    std::shared_ptr<void> register_verified_client(
+      const boost::asio::ip::tcp::endpoint &endpoint,
+      std::string cert,
+      std::string name
+    );
+
+    /**
+     * @brief Read the identity registered for one live HTTPS connection.
+     * @param endpoint Remote endpoint identifying the TLS connection.
+     * @return Certificate and client name, or no value when the connection is unregistered.
+     */
+    std::optional<std::pair<std::string, std::string>> verified_client(
+      const boost::asio::ip::tcp::endpoint &endpoint
+    );
 
     /**
      * @brief Reload paired-client authorization state from the configured state file.
