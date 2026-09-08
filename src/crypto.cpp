@@ -2,6 +2,9 @@
  * @file src/crypto.cpp
  * @brief Definitions for cryptography functions.
  */
+// standard includes
+#include <limits>
+
 // lib includes
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
@@ -143,6 +146,25 @@ namespace crypto {
 
       EVP_CIPHER_CTX_set_padding(ctx.get(), padding);
 
+      return 0;
+    }
+
+    /**
+     * @brief Initialize a reusable AES-CBC decryption context.
+     * @param ctx Context replaced with a new OpenSSL cipher context.
+     * @param key AES-128 key material.
+     * @param iv Initialization vector for the first operation.
+     * @param padding Whether PKCS#7 padding is enabled.
+     * @return Zero on success or -1 on initialization failure.
+     */
+    static int init_decrypt_cbc(cipher_ctx_t &ctx, aes_t *key, aes_t *iv, bool padding) {
+      ctx.reset(EVP_CIPHER_CTX_new());
+
+      if (!ctx || EVP_DecryptInit_ex(ctx.get(), EVP_aes_128_cbc(), nullptr, key->data(), iv->data()) != 1) {
+        return -1;
+      }
+
+      EVP_CIPHER_CTX_set_padding(ctx.get(), padding);
       return 0;
     }
 
@@ -308,6 +330,31 @@ namespace crypto {
       }
 
       return update_outlen + final_outlen;
+    }
+
+    int cbc_t::decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv) {
+      plaintext.clear();
+      if (!iv || key.size() != 16 || iv->size() != 16 || cipher.empty() || cipher.size() % 16 != 0 || cipher.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return -1;
+      }
+      if (!decrypt_ctx && init_decrypt_cbc(decrypt_ctx, &key, iv, padding)) {
+        return -1;
+      }
+
+      if (EVP_DecryptInit_ex(decrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
+        return -1;
+      }
+
+      plaintext.resize(cipher.size());
+      int update_outlen;
+      int final_outlen;
+      if (EVP_DecryptUpdate(decrypt_ctx.get(), plaintext.data(), &update_outlen, reinterpret_cast<const std::uint8_t *>(cipher.data()), static_cast<int>(cipher.size())) != 1 || EVP_DecryptFinal_ex(decrypt_ctx.get(), plaintext.data() + update_outlen, &final_outlen) != 1) {
+        plaintext.clear();
+        return -1;
+      }
+
+      plaintext.resize(static_cast<std::size_t>(update_outlen + final_outlen));
+      return 0;
     }
 
     ecb_t::ecb_t(const aes_t &key, bool padding):
