@@ -45,6 +45,16 @@ capture through ScreenCaptureKit on macOS 12.3 and later; Lumen's separate
 audio stack and controller driver remain outside the port. Add a further port
 only when an observed failure and a focused test demonstrate that it is needed.
 
+## Optional remote microphone
+
+The macOS receiver supports VoidLink's encrypted microphone extension and sends
+received voice to an explicitly selected Core Audio output UID. A virtual device
+such as Loopback Pass-Thru or BlackHole makes it available as a Mac microphone.
+No vendor SDK or driver is bundled. Global host-audio taps exclude Sunshine's own
+output; the microphone sink remains silent until that exclusion is active.
+See [setup and release checks](remote-microphone.md). Keep the receiver and
+routing changes separate from display lifecycle patches when taking upstream updates.
+
 ## Input dependency
 
 The `third-party/libvirtualhid` submodule has a companion patch in

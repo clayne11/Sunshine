@@ -19,7 +19,9 @@
 #include <limits>
 #include <mach/mach_time.h>
 #include <new>
+#include <optional>
 #include <string>
+#include <unistd.h>
 
 // local includes
 #include "coreaudio_helpers.h"
@@ -30,6 +32,40 @@
 #import <CoreAudio/CATapDescription.h>
 
 namespace {
+  platf::system_tap_exclusion_state_t system_tap_state;  ///< Shared gate state for active system taps.
+
+  /**
+   * @brief Resolve the current process to its Core Audio process object.
+   *
+   * Core Audio uses a process object ID in CATapDescription's exclusion list;
+   * the operating-system PID itself cannot be passed to that initializer.
+   *
+   * @return The current process object ID, or `std::nullopt` when Core Audio
+   *         has not exposed the process or the property query failed.
+   */
+  std::optional<AudioObjectID> current_process_object_id() noexcept {
+    AudioObjectPropertyAddress address {
+      .mSelector = kAudioHardwarePropertyTranslatePIDToProcessObject,
+      .mScope = kAudioObjectPropertyScopeGlobal,
+      .mElement = kAudioObjectPropertyElementMain,
+    };
+    const pid_t pid = getpid();
+    AudioObjectID process_object_id = kAudioObjectUnknown;
+    UInt32 data_size = sizeof(process_object_id);
+    const auto status = AudioObjectGetPropertyData(
+      kAudioObjectSystemObject,
+      &address,
+      sizeof(pid),
+      &pid,
+      &data_size,
+      &process_object_id
+    );
+    if (status != noErr || data_size != sizeof(process_object_id) || process_object_id == kAudioObjectUnknown) {
+      return std::nullopt;
+    }
+    return process_object_id;
+  }
+
   /**
    * @brief Convert seconds to the host-time tick domain used by AudioTimeStamp.
    */
@@ -211,10 +247,14 @@ namespace {
 
     return produced;
   }
-}
+}  // namespace
 
 namespace platf {
   using namespace std::literals;
+
+  bool system_audio_tap_excludes_sunshine() noexcept {
+    return system_tap_state.safe();
+  }
 
   bool request_microphone_permission(AVAuthorizationStatus authorization_status, const microphone_permission_request_t &request_access) {
     if (authorization_status == AVAuthorizationStatusNotDetermined) {
@@ -708,6 +748,14 @@ namespace platf {
     BOOST_LOG(debug) << "Process tap destroyed"sv;
   }
 
+  if (self->systemTapActive) {
+    // Keep the state registered until Core Audio has stopped and destroyed the
+    // tap, so the render path is never told that an active tap is absent.
+    system_tap_state.release(self->tapProcessExclusionConfigured);
+    self->systemTapActive = NO;
+  }
+  self->tapProcessExclusionConfigured = NO;
+
   if (self->ioProcData) {
     if (self->ioProcData->conversionBuffer) {
       free(self->ioProcData->conversionBuffer);
@@ -992,7 +1040,16 @@ namespace platf {
   using namespace std::literals;
 
   BOOST_LOG(debug) << "Creating tap description for "sv << (int) channels << " channels (using stereo tap)"sv;
+  self->tapProcessExclusionConfigured = NO;
   NSArray *excludeProcesses = @[];
+  if (const auto process_object_id = current_process_object_id()) {
+    NSNumber *process_object_number = [NSNumber numberWithUnsignedInt:*process_object_id];
+    excludeProcesses = @[process_object_number];
+    self->tapProcessExclusionConfigured = YES;
+    BOOST_LOG(debug) << "Excluding Sunshine Core Audio process object from global tap: "sv << *process_object_id;
+  } else {
+    BOOST_LOG(warning) << "Could not resolve Sunshine's Core Audio process object; global tap will not exclude Sunshine output and remote microphone forwarding will remain disabled"sv;
+  }
 
   // Always use stereo tap - it handles mono by duplicating to left/right channels
   CATapDescription *tapDescription = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:excludeProcesses];
@@ -1245,12 +1302,20 @@ namespace platf {
     return status;
   }
 
+  // Register before AudioDeviceStart can deliver the first callback.  The
+  // status remains registered until cleanup destroys the IOProc and process tap.
+  if (!self->systemTapActive) {
+    system_tap_state.retain(self->tapProcessExclusionConfigured);
+    self->systemTapActive = YES;
+  }
+
   // Start the IOProc
   BOOST_LOG(debug) << "Starting IOProc for aggregate device";
   status = AudioDeviceStart(self->aggregateDeviceID, self->ioProcID);
   if (status != kAudioHardwareNoError) {
     BOOST_LOG(error) << "AudioDeviceStart failed: " << ca::Status(status);
     AudioDeviceDestroyIOProcID(self->aggregateDeviceID, self->ioProcID);
+    self->ioProcID = NULL;
     return status;
   }
 

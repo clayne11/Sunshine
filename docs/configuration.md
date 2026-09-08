@@ -829,6 +829,31 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### microphone_sink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            On macOS, the exact Core Audio output-device UID used to forward a compatible client's microphone.
+            An empty value disables microphone forwarding. This setting is separate from host audio capture.
+            Use a virtual audio device that routes its output to an input, such as a Loopback Pass-Thru device
+            or BlackHole. Sunshine sends the received microphone to this device; select its input in the Mac app
+            that needs the microphone. Sunshine does not change the system's default input or output.
+            @note{Requires a client supporting the encrypted VoidLink microphone extension. Ordinary Moonlight
+            clients do not gain microphone support from this host setting alone.}
+            @note{Only one streaming session can own the microphone receiver. If the configured device is unavailable,
+            video and host audio continue without microphone forwarding. No fallback output device is selected.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Empty (disabled)</td>
+    </tr>
+</table>
+
+See [remote microphone setup](remote-microphone.md) for routing and validation.
+
 ### stream_audio
 
 <table>

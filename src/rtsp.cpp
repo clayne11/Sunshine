@@ -29,6 +29,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "remote_microphone.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -1039,6 +1040,13 @@ namespace rtsp_stream {
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
 
+#ifdef __APPLE__
+    if (!config::audio.microphone_sink.empty()) {
+      encryption_flags_supported |= remote_microphone::ENCRYPTION_FLAG;
+      encryption_flags_requested |= remote_microphone::ENCRYPTION_FLAG;
+    }
+#endif
+
     // Determine the encryption desired for this remote endpoint
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
     if (encryption_mode != config::ENCRYPTION_MODE_NEVER) {
@@ -1137,6 +1145,14 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv) {
+      port = net::map_port(remote_microphone::STREAM_PORT);
+#ifdef __APPLE__
+      session.microphone_setup = !config::audio.microphone_sink.empty();
+#endif
+      if (!session.microphone_setup) {
+        BOOST_LOG(info) << "Ignoring microphone SETUP because forwarding is disabled"sv;
+      }
     } else {
       cmd_not_found(sock, session, std::move(req));
 
@@ -1405,6 +1421,16 @@ namespace rtsp_stream {
 
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
       return;
+    }
+
+    if (session.microphone_setup) {
+      const bool authenticated = !session.client_cert.empty();
+      const bool encrypted = (config.encryptionFlagsEnabled & remote_microphone::ENCRYPTION_FLAG) != 0;
+      if (authenticated && encrypted) {
+        config.microphone_sink_uid = config::audio.microphone_sink;
+      } else {
+        BOOST_LOG(warning) << "Microphone forwarding refused because the RTSP session is not authenticated with negotiated microphone encryption"sv;
+      }
     }
 
     auto stream_session = stream::session::alloc(config, session);

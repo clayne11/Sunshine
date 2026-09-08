@@ -6,8 +6,7 @@ manifest under the recovery directory. It does not write the live
 `~/Library/LaunchAgents` file or call `launchctl`.
 
 Virtual-display sessions on macOS 12.3 and later use ScreenCaptureKit (SCK)
-for virtual-display recreation and capture. The native upstream audio path is
-unchanged. These notes describe the selected implementation; they do not
+for virtual-display recreation and capture. Host audio uses the native upstream capture path. These notes describe the selected implementation; they do not
 claim that a live session has been validated.
 
 The selected defaults are:

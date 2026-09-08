@@ -214,6 +214,7 @@ namespace config {
   struct audio_t {
     std::string sink;  ///< Audio output device/sink to use for audio capture
     std::string virtual_sink;  ///< Virtual audio sink for audio routing
+    std::string microphone_sink;  ///< Exact output-device UID used for optional remote microphone forwarding.
     bool stream;  ///< Enable audio streaming to clients
     bool install_steam_drivers;  ///< Install Steam audio drivers for enhanced compatibility
   };

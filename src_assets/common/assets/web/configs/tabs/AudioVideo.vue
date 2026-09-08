@@ -90,6 +90,14 @@ const virtualDisplayEnabled = computed(() => {
     <!-- macOS Virtual Display -->
     <PlatformLayout :platform="platform">
       <template #macos>
+        <div class="mb-3">
+          <label for="microphone_sink" class="form-label">{{ $t('config.microphone_sink') }}</label>
+          <input type="text" class="form-control" id="microphone_sink"
+                 :placeholder="$t('config.microphone_sink_placeholder')"
+                 v-model="config.microphone_sink" />
+          <div class="form-text">{{ $t('config.microphone_sink_desc') }}</div>
+        </div>
+
         <Checkbox class="mb-3"
                   id="virtual_display"
                   locale-prefix="config"

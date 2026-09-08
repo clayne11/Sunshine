@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <string>
 #include <utility>
 
 // lib includes
@@ -37,6 +38,7 @@ namespace stream {
     int videoQosType;  ///< Video QoS type.
 
     uint32_t encryptionFlagsEnabled;  ///< Bitmask of GameStream encryption features enabled for the session.
+    std::string microphone_sink_uid;  ///< Exact Core Audio UID for encrypted client microphone playout.
 
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };

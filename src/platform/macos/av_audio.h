@@ -37,6 +37,94 @@ namespace platf {
   using microphone_permission_request_t = std::function<void(microphone_permission_callback_t)>;  ///< Function that starts a microphone permission request.
 
   /**
+   * @brief Coherent state for active system taps and process exclusions.
+   *
+   * The two counters share one atomic word so the remote microphone gate never
+   * observes a partially updated multi-tap state.  The low 32 bits contain the
+   * active-tap count and the high 32 bits contain the count that excludes
+   * Sunshine's process.
+   */
+  class system_tap_exclusion_state_t {
+  public:
+    /**
+     * @brief Register an active system tap.
+     * @param process_excluded Whether the tap excludes Sunshine's process.
+     */
+    void retain(bool process_excluded) noexcept {
+      auto current = packed_counts_.load(std::memory_order_relaxed);
+      while (true) {
+        const auto active = active_count(current);
+        const auto excluded = excluded_count(current);
+        if (active == max_count || (process_excluded && excluded == max_count)) {
+          return;
+        }
+
+        const auto desired = pack_counts(active + 1, excluded + (process_excluded ? 1 : 0));
+        if (packed_counts_.compare_exchange_weak(current, desired, std::memory_order_release, std::memory_order_relaxed)) {
+          return;
+        }
+      }
+    }
+
+    /**
+     * @brief Unregister an active system tap.
+     * @param process_excluded Whether the tap excludes Sunshine's process.
+     */
+    void release(bool process_excluded) noexcept {
+      auto current = packed_counts_.load(std::memory_order_acquire);
+      while (true) {
+        const auto active = active_count(current);
+        const auto excluded = excluded_count(current);
+        if (active == 0 || (process_excluded && excluded == 0)) {
+          return;
+        }
+
+        const auto desired = pack_counts(active - 1, excluded - (process_excluded ? 1 : 0));
+        if (packed_counts_.compare_exchange_weak(current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          return;
+        }
+      }
+    }
+
+    /**
+     * @brief Check whether all active taps exclude Sunshine's process.
+     * @return True when at least one active tap exists and every active tap excludes Sunshine.
+     */
+    [[nodiscard]] bool safe() const noexcept {
+      const auto current = packed_counts_.load(std::memory_order_acquire);
+      const auto active = active_count(current);
+      return active != 0 && active == excluded_count(current);
+    }
+
+  private:
+    static constexpr std::uint32_t max_count = std::numeric_limits<std::uint32_t>::max();  ///< Maximum representable tap count.
+    static constexpr std::uint64_t low_count_mask = max_count;  ///< Mask for the active-tap count.
+
+    /**
+     * @brief Pack active and excluded tap counts into one atomic value.
+     */
+    static constexpr std::uint64_t pack_counts(std::uint32_t active, std::uint32_t excluded) noexcept {
+      return static_cast<std::uint64_t>(active) | (static_cast<std::uint64_t>(excluded) << 32);
+    }
+
+    /**
+     * @brief Read the active-tap count from a packed state value.
+     */
+    static constexpr std::uint32_t active_count(std::uint64_t packed_counts) noexcept {
+      return static_cast<std::uint32_t>(packed_counts & low_count_mask);
+    }
+
+    /**
+     * @brief Read the excluded-tap count from a packed state value.
+     */
+    static constexpr std::uint32_t excluded_count(std::uint64_t packed_counts) noexcept {
+      return static_cast<std::uint32_t>(packed_counts >> 32);
+    }
+
+    std::atomic<std::uint64_t> packed_counts_ {0};  ///< Atomically packed active and excluded tap counts.
+  };
+
+  /**
    * @brief Resolve microphone access from an AVFoundation authorization state.
    *
    * @param authorization_status Current authorization state for audio capture.
@@ -78,6 +166,17 @@ namespace platf {
    * @return Core Audio status code from the IO callback.
    */
   OSStatus systemAudioIOProc(AudioObjectID inDevice, const AudioTimeStamp *_Nullable inNow, const AudioBufferList *_Nullable inInputData, const AudioTimeStamp *_Nullable inInputTime, AudioBufferList *_Nullable outOutputData, const AudioTimeStamp *_Nullable inOutputTime, void *_Nullable inClientData);
+
+  /**
+   * @brief Check whether every active system tap excludes Sunshine's own audio process.
+   *
+   * The remote microphone sink uses this status before it renders into a virtual
+   * output.  When a system tap is active, the sink must remain silent unless every
+   * active tap excludes Sunshine's process output.
+   *
+   * @return `true` when an active system tap exists and all active taps exclude Sunshine.
+   */
+  [[nodiscard]] bool system_audio_tap_excludes_sunshine() noexcept;
 }  // namespace platf
 
 /**
@@ -181,6 +280,8 @@ typedef struct {
   AudioDeviceIOProcID ioProcID;  ///< IOProc identifier for real-time audio processing
   AVAudioIOProcData *_Nullable ioProcData;  ///< Context data for IOProc callbacks and format conversion
   AVAudioTelemetry *_Nullable audioTelemetry;  ///< Bounded diagnostics for the active audio session
+  BOOL tapProcessExclusionConfigured;  ///< Whether this tap description excludes Sunshine's process object
+  BOOL systemTapActive;  ///< Whether this instance registered an active system-tap status
 }
 
 // AVFoundation microphone capture properties

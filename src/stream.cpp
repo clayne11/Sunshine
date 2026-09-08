@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <utility>
@@ -31,6 +32,7 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "remote_microphone.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -496,6 +498,8 @@ namespace stream {
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
+    std::mutex microphone_mutex;  ///< Serializes receiver start and teardown.
+    std::unique_ptr<remote_microphone::session_t> microphone;  ///< Optional encrypted client-microphone receiver.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
 
@@ -2206,6 +2210,10 @@ namespace stream {
         return;
       }
 
+      {
+        std::lock_guard microphone_lock {session.microphone_mutex};
+        session.microphone.reset();
+      }
       session.shutdown_event->raise(true);
     }
 
@@ -2227,6 +2235,10 @@ namespace stream {
         task_pool.cancel(force_kill);
       });
 
+      {
+        std::lock_guard microphone_lock {session.microphone_mutex};
+        session.microphone.reset();
+      }
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
@@ -2305,6 +2317,23 @@ namespace stream {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
         system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
 #endif
+      }
+
+      if (!session.config.microphone_sink_uid.empty()) {
+        std::lock_guard microphone_lock {session.microphone_mutex};
+        if (session.state.load(std::memory_order_relaxed) == state_e::RUNNING) {
+          session.microphone = remote_microphone::start({
+            .session_id = session.launch_session_id,
+            .client_address = addr,
+            .key = session.audio.cipher.key,
+            .key_id = session.audio.avRiKeyId,
+            .sink_uid = session.config.microphone_sink_uid,
+            .encryption_negotiated = (session.config.encryptionFlagsEnabled & remote_microphone::ENCRYPTION_FLAG) != 0,
+          });
+          if (!session.microphone) {
+            BOOST_LOG(warning) << "Remote microphone forwarding could not start; video and host audio will continue"sv;
+          }
+        }
       }
 
       return 0;

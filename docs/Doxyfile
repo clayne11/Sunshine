@@ -45,6 +45,7 @@ INPUT = ../README.md \
         gamestream_migration.md \
         legal.md \
         configuration.md \
+        remote-microphone.md \
         app_examples.md \
         awesome_sunshine.md \
         guides.md \

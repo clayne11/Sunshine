@@ -37,6 +37,23 @@ struct ProcessSystemAudioIOProcTestParams {
 class AVAudioTest: public PlatformTestSuite, public ::testing::WithParamInterface<ProcessSystemAudioIOProcTestParams> {};
 
 /**
+ * @brief Test atomic tap-state transitions used by the remote microphone gate.
+ */
+TEST(SystemTapExclusionState, TracksOnlyFullyExcludedActiveTaps) {
+  platf::system_tap_exclusion_state_t state;
+
+  EXPECT_FALSE(state.safe());
+  state.retain(true);
+  EXPECT_TRUE(state.safe());
+  state.retain(false);
+  EXPECT_FALSE(state.safe());
+  state.release(false);
+  EXPECT_TRUE(state.safe());
+  state.release(true);
+  EXPECT_FALSE(state.safe());
+}
+
+/**
  * @brief Test that findMicrophone handles nil input gracefully.
  * Verifies the method returns nil when passed a nil microphone name.
  */
