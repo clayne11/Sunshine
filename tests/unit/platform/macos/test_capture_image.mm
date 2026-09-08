@@ -263,6 +263,17 @@ namespace {
     EXPECT_NE(platf::macos_capture_image::make_dummy(plain_image, kImageWidth, kImageHeight, kCVPixelFormatType_32BGRA), 0);
   }
 
+  TEST_F(CaptureImageTest, MakeDummyReturnsSyntheticImageWithoutCaptureSession) {
+    platf::av_img_t image;
+
+    ASSERT_EQ(platf::macos_capture_image::make_dummy(image, kImageWidth, kImageHeight, kCVPixelFormatType_32BGRA), 0);
+    ASSERT_NE(image.sample_buffer, nullptr);
+    ASSERT_NE(image.pixel_buffer, nullptr);
+    EXPECT_EQ(CVPixelBufferGetPixelFormatType(image.pixel_buffer->buf), kCVPixelFormatType_32BGRA);
+    EXPECT_EQ(image.width, kImageWidth);
+    EXPECT_EQ(image.height, kImageHeight);
+  }
+
   TEST_P(DummyImageTest, CreatesIosurfaceBackedBlackBuffer) {
     const auto &format = GetParam();
     CVPixelBufferRef probe = make_pixel_buffer(kImageWidth, kImageHeight, format.pixel_format);

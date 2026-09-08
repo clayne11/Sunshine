@@ -151,48 +151,18 @@ namespace platf {
 
     /**
      * @brief Populate a fallback image when real capture data is unavailable.
+     * @details Allocates and fills a local CoreVideo image without starting an
+     *          AVFoundation capture output, so encoder probing cannot wait on
+     *          a display that disappeared during setup.
      *
      * @param img Image or frame object to read from or populate.
      * @return Capture status reported to the streaming pipeline.
      */
     int dummy_img(img_t *img) override {
-      if (!platf::is_screen_capture_allowed()) {
-        // If we don't have the screen capture permission, this function will hang
-        // indefinitely without doing anything useful. Exit instead to avoid this.
-        // A non-zero return value indicates failure to the calling function.
+      if (!img || !platf::is_screen_capture_allowed()) {
         return 1;
       }
-
-      auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
-        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
-        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
-
-        auto av_img = (av_img_t *) img;
-
-        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
-          av_img->sample_buffer,
-          av_img->pixel_buffer,
-          img->data
-        );
-
-        av_img->sample_buffer = new_sample_buffer;
-        av_img->pixel_buffer = new_pixel_buffer;
-        img->data = new_pixel_buffer->data();
-
-        img->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
-        img->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
-        img->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img->pixel_pitch = img->row_pitch / img->width;
-
-        old_data_retainer = nullptr;
-
-        // returning false here stops capture backend
-        return false;
-      }];
-
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
-
-      return 0;
+      return macos_capture_image::make_dummy(*img, av_capture.frameWidth, av_capture.frameHeight, av_capture.pixelFormat);
     }
 
     /**
