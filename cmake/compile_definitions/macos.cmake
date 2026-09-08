@@ -36,6 +36,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${CORE_VIDEO_LIBRARY}
         ${FOUNDATION_LIBRARY}
         ${IOKIT_LIBRARY}
+        ${SCREEN_CAPTURE_KIT_LIBRARY}
         ${VIDEO_TOOLBOX_LIBRARY})
 
 set(APPLE_PLIST_TEMPLATE "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
@@ -49,6 +50,10 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_img_t.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.h"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/av_video.m"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/capture_image.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/capture_image.mm"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.m"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/display.mm"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/input.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.h"
@@ -67,4 +72,9 @@ set(PLATFORM_TARGET_FILES
 # The virtual-display controller uses ARC for Foundation object ownership.
 set_source_files_properties(
         "${CMAKE_SOURCE_DIR}/src/platform/macos/virtual_display.m"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
+# The ScreenCaptureKit controller uses ARC for asynchronous framework objects.
+set_source_files_properties(
+        "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

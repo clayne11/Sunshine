@@ -158,6 +158,9 @@ if (APPLE)
     file(GLOB_RECURSE MACOS_TEST_SOURCES CONFIGURE_DEPENDS
             ${CMAKE_SOURCE_DIR}/tests/*.mm)
     list(APPEND TEST_SOURCES ${MACOS_TEST_SOURCES})
+    set_source_files_properties(
+            "${CMAKE_SOURCE_DIR}/src/platform/macos/sc_capture.m"
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif ()
 
 set(SUNSHINE_SOURCES

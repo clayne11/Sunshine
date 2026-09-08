@@ -1054,6 +1054,9 @@ editing the `conf` file in a text editor. Use the examples as reference.
             On macOS, create a temporary virtual display for each client session. The display matches the client's
             requested width, height, and frame rate. The expected behavior is for Sunshine to remove the display after
             the last client disconnects and clean it up if startup fails.
+            On macOS 12.3 and later, video capture for a session-owned virtual display uses ScreenCaptureKit. The
+            capture stream resolves the current virtual display when it starts, allowing a recreated display to be
+            captured after reconnect. Native Sunshine audio capture remains unchanged.
             @note{This option is only supported on macOS.}
         </td>
     </tr>

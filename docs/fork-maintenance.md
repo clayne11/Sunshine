@@ -14,6 +14,9 @@ starting this fork. Existing copyright and license terms remain applicable.
 Retained capabilities:
 
 - Create a macOS virtual display matching the connecting client's requested mode.
+- Use ScreenCaptureKit for video capture of session-owned virtual displays on macOS
+  12.3 and later, resolving the current display again when a stream starts after
+  recreation. The native Sunshine audio capture path remains unchanged.
 - Optionally make it the only active display for the streaming session, using
   temporary display configuration owned by the helper.
 - Target input at the current captured display, including its current logical
@@ -31,10 +34,11 @@ Retained capabilities:
   together is not a tested guarantee.
 - Stage and install a login-session service with restart supervision and rollback.
 
-Current Sunshine already supplies the audio, encoding, packaging, and general
-streaming foundation. Lumen's separate capture/audio stack and controller driver
-are deliberately outside this initial port. Add a further port only when an
-observed failure and a focused test demonstrate that it is needed.
+Current upstream Sunshine already supplies the audio, encoding, packaging, and
+general streaming foundation. This selective port adds virtual-display video
+capture through ScreenCaptureKit on macOS 12.3 and later; Lumen's separate
+audio stack and controller driver remain outside the port. Add a further port
+only when an observed failure and a focused test demonstrate that it is needed.
 
 ## Input dependency
 
