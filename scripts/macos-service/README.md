@@ -1,81 +1,99 @@
 # Sunshine macOS login service
 
-These assets keep the selected Sunshine or Lumen runtime attached to the
-logged-in Aqua session while making launchd restart it after either a crash or
-a clean process exit.
+`sunshine_service.py` stages a direct Sunshine executable in an Aqua
+LaunchAgent. The default operation only creates a reviewable plist and JSON
+manifest under the recovery directory. It does not write the live
+`~/Library/LaunchAgents` file or call `launchctl`.
 
-The `CGVirtualDisplay` lifecycle is held by a separate helper. Private hardware
-enablement targets physical displays only. Normal shutdown restores them before
-releasing the virtual display, and a surviving supervisor attempts restoration
-after a holder crash. App-only configuration does not restore hardware
-automatically after a crash. The supervisor uses a separate process group to
-survive launchd cleanup of a crashed server. Validate each single-process
-failure on the target Mac before activation; simultaneous supervisor and holder
-failure remains untested.
+Virtual-display sessions on macOS 12.3 and later use ScreenCaptureKit (SCK)
+for virtual-display recreation and capture. The native upstream audio path is
+unchanged. These notes describe the selected implementation; they do not
+claim that a live session has been validated.
 
-The launcher remains at the existing app-bundle path so the current
-`com.clayne.lumen` job and macOS privacy identity continue to refer to the same
-bundle. It waits for an existing TCP 47990 listener to disappear before
-starting the configured runtime (default
-`~/.local/share/sunshine-personal/sunshine`); this avoids duplicate Sunshine
-instances during launchd handoff. When the existing Lumen
-wrapper is selected, the launcher refuses a first run without the existing
-`.permissions_configured` marker because a login-session job has no terminal
-for the permission guide. A direct Sunshine runtime does not use that marker.
+The selected defaults are:
 
-Install the files from the repository root with:
+* executable: `~/Applications/Sunshine Test.app/Contents/MacOS/Sunshine`
+* configuration: `~/.config/sunshine-personal/config/sunshine.conf`
+* web UI: `https://localhost:47990`
+* service label: `com.clayne.sunshine`
+* plist: `~/Library/LaunchAgents/com.clayne.sunshine.plist`
+* recovery root: `~/Library/Application Support/Sunshine/service-recovery`
+
+The generated plist passes the configuration path as Sunshine's first
+argument. It uses `RunAtLoad`, `KeepAlive=true`, `LimitLoadToSessionType=Aqua`,
+`ProcessType=Interactive`, `ExitTimeOut=20`, and `ThrottleInterval=15`. The
+runtime is launched directly; no login launcher or listener handoff process is
+inserted.
+
+## Stage and review
+
+From the repository root, stage the default paths with:
 
 ```sh
-scripts/macos-service/install.sh
+python3 scripts/macos-service/sunshine_service.py
 ```
 
-The installer defaults to the staged fork at
-`~/.local/share/sunshine-personal/sunshine`. To keep the existing Lumen runtime
-or select another build while preserving the same app-bundle launch path, pass
-its absolute command path. `--config` selects the isolated configuration file
-passed as Sunshine's first argument:
+Review the generated `staged/com.clayne.sunshine.plist` and
+`manifest.json`. Override paths before staging another build:
 
 ```sh
-scripts/macos-service/install.sh --runtime "$HOME/.local/bin/lumen"
+python3 scripts/macos-service/sunshine_service.py \
+  --runtime "$HOME/Applications/Sunshine Test.app/Contents/MacOS/Sunshine" \
+  --config "$HOME/.config/sunshine-personal/config/sunshine.conf" \
+  --recovery-dir "$HOME/Library/Application Support/Sunshine/service-recovery"
 ```
 
-The Sunshine defaults are `~/.config/sunshine-personal/sunshine.conf` and web
-port `48990` (base port `48989`). Override them with `--config PATH` and
-`--web-port PORT` when staging another runtime.
+Staging does not require the executable or config file to exist, which allows
+the artifact to be reviewed before a build is installed. Activation performs
+those checks and refuses missing or non-executable inputs.
 
-The default install stages the launcher and plist under a unique directory such
-as `$HOME/Documents/default/tmp/lumen-recovery/service-20260907-120000-AbCd12/staged`;
-it does not change the live launcher, plist, or launchd job. The unique suffix
-keeps two staging or activation runs in the same second separate. During a
-planned maintenance window, validate the runtime and activate it with:
+## Explicit activation and rollback
+
+Run this only after reviewing the staged plist and testing the selected
+runtime in an isolated session:
 
 ```sh
-scripts/macos-service/install.sh --activate
+python3 scripts/macos-service/sunshine_service.py --activate
 ```
 
-Combine `--runtime PATH` with `--activate` only after that runtime has been
-tested in an isolated session. The old Lumen command remains the fallback until
-the new runtime is explicitly selected.
+Activation saves the previous Sunshine plist and its mode, records the
+launchd enabled state, then atomically installs the direct-app plist. It boots
+out and disables `com.clayne.lumen` and `com.clayne.sunshine.staging` while
+leaving their plist and app files untouched. The latter's plist is kept at
+`~/.config/sunshine-personal/service/com.clayne.sunshine.staging.plist`. The
+old enabled states are recorded in the activation manifest. It then bootstraps and enables
+`com.clayne.sunshine`.
 
-Activation saves the previous launcher and plist under the same recovery
-directory. If a live file did not exist, the backup contains a `.absent` marker
-so a failed activation or rollback removes only that newly created file. To
-restore one of those backups, run:
+Use the manifest printed by activation to restore the previous state:
 
 ```sh
-scripts/macos-service/rollback.sh "$HOME/Documents/default/tmp/lumen-recovery/service-YYYYMMDD-HHMMSS"
+python3 scripts/macos-service/sunshine_service.py \
+  --rollback "$HOME/Library/Application Support/Sunshine/service-recovery/service-YYYYMMDD-HHMMSS-XXXXXX/manifest.json"
 ```
 
-The plist keeps `RunAtLoad`, `LimitLoadToSessionType=Aqua`, and the existing
-stdout/stderr log locations. `KeepAlive=true` is deliberate: launchd should
-bring the selected runtime back after a nonzero or zero exit.
-`ThrottleInterval=15` prevents a rapid crash loop from consuming the login
-session. `ExitTimeOut=20` gives a bounded graceful-shutdown window for the
-runtime and helper to restore physical displays before launchd sends SIGKILL.
+Rollback boots out Sunshine, restores the prior plist (or removes the newly
+created one), re-loads jobs that were loaded before activation, and restores
+the recorded enabled states. If an installation uses a different legacy
+label, repeat `--old-label LABEL --old-plist PATH` during both staging and
+activation. Unknown labels otherwise default to
+`$HOME/Library/LaunchAgents/LABEL.plist`.
 
-Read-only checks after activation:
+## Verification and tests
+
+After an approved activation, inspect the job and web listener:
 
 ```sh
-launchctl print "gui/$(id -u)/com.clayne.lumen"
+launchctl print "gui/$(id -u)/com.clayne.sunshine"
 lsof -nP -a -iTCP:47990 -sTCP:LISTEN
 ```
+
+The fixture test uses a temporary home and fake `launchctl`, so it does not
+change the current login session:
+
+```sh
+python3 scripts/macos-service/test_sunshine_service.py
+```
+
+`install.sh`, `rollback.sh`, `LumenLoginLauncher`, and
+`com.clayne.lumen.plist.in` remain in this directory as the legacy Lumen
+workflow and are intentionally not modified by the Sunshine-only tool.
