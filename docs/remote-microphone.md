@@ -33,6 +33,15 @@ redirect received voice to the speakers, and failure to initialize the receiver
 does not stop video or host audio. Disconnecting releases the receiver and its
 device. Sunshine does not change the system input or output defaults.
 
+Core Audio sink initialization and disposal run in one isolated worker so a
+stalled audio driver cannot block RTSP, video, or session teardown. If that
+worker remains stuck inside the driver, microphone forwarding stays unavailable
+for later sessions until Sunshine restarts; streaming and reconnects remain
+available. A reconnect waits at most 500 ms for normal sink disposal before it
+continues without microphone forwarding. The worker retains no session key, UDP
+socket, or decoder after the streaming session ends, and canceled sessions
+cannot publish delayed audio.
+
 ## Protocol and limitations
 
 The implementation follows the microphone wire format in

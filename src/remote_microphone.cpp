@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -44,6 +46,9 @@ namespace remote_microphone {
     constexpr std::int64_t max_late_packets = 4;
     constexpr std::int64_t max_forward_packets = 8;
     constexpr std::size_t max_consecutive_plc_frames = 2;
+    constexpr std::size_t sink_mailbox_frames = 1;
+    constexpr auto sink_handoff_grace = 500ms;  ///< Maximum wait for normal sink disposal during reconnect.
+    constexpr auto sink_handoff_poll_interval = 5ms;  ///< Poll interval while the previous sink worker exits.
 
     std::mutex owner_mutex;  ///< Serializes single-owner admission and release.
     std::uint32_t owner_session_id {};  ///< Session currently permitted to receive microphone data.
@@ -86,7 +91,139 @@ namespace remote_microphone {
         owner_session_id = 0;
       }
     }
+
+    /**
+     * @brief Return the process-lifetime gate for Core Audio sink work.
+     */
+    detail::initializer_gate_t &sink_initializer_gate() {
+      static auto *gate = new detail::initializer_gate_t;
+      return *gate;
+    }
   }  // namespace
+
+  struct detail::sink_mailbox_t::impl_t {
+    mutable std::mutex mutex;  ///< Serializes state and queued audio.
+    std::condition_variable changed;  ///< Wakes the sink worker for audio or cancellation.
+    sink_state_e state {sink_state_e::pending};  ///< Current initialization lifetime state.
+    std::deque<pcm_frame_t> frames;  ///< At most the newest decoded frame.
+  };
+
+  detail::sink_mailbox_t::sink_mailbox_t():
+      impl_ {std::make_unique<impl_t>()} {
+  }
+
+  detail::sink_mailbox_t::~sink_mailbox_t() = default;
+
+  bool detail::sink_mailbox_t::activate() {
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->state != sink_state_e::pending) {
+      return false;
+    }
+    impl_->state = sink_state_e::ready;
+    impl_->changed.notify_all();
+    return true;
+  }
+
+  bool detail::sink_mailbox_t::fail() {
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->state == sink_state_e::canceled || impl_->state == sink_state_e::failed) {
+      return false;
+    }
+    impl_->state = sink_state_e::failed;
+    impl_->frames.clear();
+    impl_->changed.notify_all();
+    return true;
+  }
+
+  void detail::sink_mailbox_t::cancel() {
+    std::lock_guard lock {impl_->mutex};
+    impl_->state = sink_state_e::canceled;
+    impl_->frames.clear();
+    impl_->changed.notify_all();
+  }
+
+  bool detail::sink_mailbox_t::write(std::span<const std::int16_t> samples) {
+    if (samples.size() != FRAME_SAMPLES) {
+      return false;
+    }
+
+    std::lock_guard lock {impl_->mutex};
+    if (impl_->state != sink_state_e::ready) {
+      return false;
+    }
+    const bool queued_without_drop = impl_->frames.empty();
+    if (impl_->frames.size() == sink_mailbox_frames) {
+      impl_->frames.pop_front();
+    }
+    pcm_frame_t frame;
+    std::ranges::copy(samples, frame.begin());
+    impl_->frames.emplace_back(std::move(frame));
+    impl_->changed.notify_one();
+    return queued_without_drop;
+  }
+
+  bool detail::sink_mailbox_t::consume_frame(const std::function<void(std::span<const std::int16_t>)> &consumer) {
+    if (!consumer) {
+      return false;
+    }
+
+    std::unique_lock lock {impl_->mutex};
+    impl_->changed.wait(lock, [&]() {
+      return impl_->state != sink_state_e::ready || !impl_->frames.empty();
+    });
+    if (impl_->state != sink_state_e::ready) {
+      return false;
+    }
+
+    auto frame = std::move(impl_->frames.front());
+    impl_->frames.pop_front();
+    consumer(frame);
+    return true;
+  }
+
+  detail::sink_state_e detail::sink_mailbox_t::state() const {
+    std::lock_guard lock {impl_->mutex};
+    return impl_->state;
+  }
+
+  struct detail::initializer_gate_t::state_t {
+    std::atomic_bool busy {};  ///< Whether the single quarantined worker is occupied.
+  };
+
+  detail::initializer_gate_t::initializer_gate_t():
+      state_ {std::make_shared<state_t>()} {
+  }
+
+  detail::initializer_gate_t::~initializer_gate_t() = default;
+
+  bool detail::initializer_gate_t::try_run(std::function<void()> task) {
+    if (!task) {
+      return false;
+    }
+
+    bool expected = false;
+    if (!state_->busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return false;
+    }
+
+    try {
+      std::thread {[state = state_, task = std::move(task)]() mutable {
+        try {
+          task();
+        } catch (...) {
+        }
+        state->busy.store(false, std::memory_order_release);
+      }}.detach();
+    } catch (...) {
+      state_->busy.store(false, std::memory_order_release);
+      return false;
+    }
+    return true;
+  }
+
+  bool detail::initializer_gate_t::busy() const noexcept {
+    return state_->busy.load(std::memory_order_acquire);
+  }
 
   std::optional<sequence_result_t> sequence_window_t::accept(std::uint16_t sequence, bool reanchor_forward) {
     if (!maximum_sequence_) {
@@ -184,9 +321,7 @@ namespace remote_microphone {
     boost::asio::ip::udp::socket socket {io_context};  ///< Nonblocking microphone datagram socket.
     crypto::cipher::cbc_t cipher;  ///< Reusable AES-CBC decryption context.
     opus_decoder_t decoder;  ///< Mono 48 kHz Opus decoder.
-#ifdef __APPLE__
-    std::unique_ptr<platf::remote_microphone::sink_t> sink;  ///< Selected Core Audio output device.
-#endif
+    std::shared_ptr<detail::sink_mailbox_t> sink_mailbox;  ///< Quarantined sink delivery mailbox.
     std::jthread worker;  ///< Cooperative receiver and playout thread.
     sequence_window_t sequence_window;  ///< Replay and sequence-wrap admission state.
     std::map<std::int64_t, std::vector<std::uint8_t>> packets;  ///< Bounded ordered jitter queue.
@@ -204,11 +339,13 @@ namespace remote_microphone {
      * @param session_config Authenticated session attributes.
      * @param session_cipher AES-CBC context for client packets.
      * @param opus_decoder Opus decoder for mono 48 kHz frames.
+     * @param mailbox Shared delivery state owned by the quarantined sink worker.
      */
-    impl_t(session_config_t session_config, crypto::cipher::cbc_t session_cipher, opus_decoder_t opus_decoder):
+    impl_t(session_config_t session_config, crypto::cipher::cbc_t session_cipher, opus_decoder_t opus_decoder, std::shared_ptr<detail::sink_mailbox_t> mailbox):
         config {std::move(session_config)},
         cipher {std::move(session_cipher)},
-        decoder {std::move(opus_decoder)} {
+        decoder {std::move(opus_decoder)},
+        sink_mailbox {std::move(mailbox)} {
     }
 
     /**
@@ -222,6 +359,9 @@ namespace remote_microphone {
       std::array<std::int16_t, FRAME_SAMPLES> pcm;
 
       while (!stop_token.stop_requested()) {
+        if (sink_mailbox->state() == detail::sink_state_e::failed) {
+          break;
+        }
         bool receive_failed = false;
         for (int attempt = 0; attempt < 16; ++attempt) {
           boost::system::error_code ec;
@@ -294,11 +434,9 @@ namespace remote_microphone {
           }
 
           if (decoded_samples == static_cast<int>(pcm.size())) {
-#ifdef __APPLE__
-            if (!sink->write(pcm)) {
+            if (!sink_mailbox->write(pcm)) {
               ++sink_drops;
             }
-#endif
           } else {
             ++rejected_packets;
           }
@@ -343,35 +481,30 @@ namespace remote_microphone {
       return;
     }
     const auto session_id = impl_->config.session_id;
+    impl_->sink_mailbox->cancel();
     impl_->worker.request_stop();
     impl_->worker.join();
     impl_.reset();
     release_owner(session_id);
   }
 
-  std::unique_ptr<session_t> start(session_config_t session_config) {
-    if (session_config.session_id == 0 || session_config.sink_uid.empty() || !session_config.encryption_negotiated || session_config.key.size() != 16) {
+  std::unique_ptr<session_t> detail::start_for_testing(session_config_t session_config, initializer_gate_t &gate, sink_worker_t sink_worker, std::uint16_t port) {
+    if (session_config.session_id == 0 || session_config.sink_uid.empty() || !session_config.encryption_negotiated || session_config.key.size() != 16 || !sink_worker) {
       return nullptr;
     }
 
-    std::lock_guard owner_lock {owner_mutex};
-    if (owner_session_id != 0) {
-      BOOST_LOG(warning) << "Remote microphone is already owned by another streaming session"sv;
-      return nullptr;
+    const auto session_id = session_config.session_id;
+    {
+      std::lock_guard owner_lock {owner_mutex};
+      if (owner_session_id != 0) {
+        BOOST_LOG(warning) << "Remote microphone is already owned by another streaming session"sv;
+        return nullptr;
+      }
+      owner_session_id = session_id;
     }
-
-#ifndef __APPLE__
-    return nullptr;
-#else
-    if (!platf::remote_microphone::available(session_config.sink_uid)) {
-      BOOST_LOG(error) << "Configured remote microphone output device is unavailable"sv;
-      return nullptr;
-    }
-    auto sink = platf::remote_microphone::make_sink(session_config.sink_uid);
-    if (!sink) {
-      BOOST_LOG(error) << "Failed to open configured remote microphone output device"sv;
-      return nullptr;
-    }
+    auto owner_guard = util::fail_guard([session_id]() {
+      release_owner(session_id);
+    });
 
     int opus_error;
     opus_decoder_t decoder {opus_decoder_create(48000, 1, &opus_error)};
@@ -381,10 +514,10 @@ namespace remote_microphone {
     }
 
     crypto::cipher::cbc_t cipher {session_config.key, true};
-    auto impl = std::make_unique<session_t::impl_t>(std::move(session_config), std::move(cipher), std::move(decoder));
-    impl->sink = std::move(sink);
+    auto sink_mailbox = std::make_shared<detail::sink_mailbox_t>();
+    auto impl = std::make_unique<session_t::impl_t>(std::move(session_config), std::move(cipher), std::move(decoder), sink_mailbox);
 
-    const auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    const auto address_family = port == 0 ? net::IPV4 : net::af_from_enum_string(config::sunshine.address_family);
     const auto protocol = address_family == net::IPV4 ? boost::asio::ip::udp::v4() : boost::asio::ip::udp::v6();
     boost::system::error_code ec;
     impl->socket.open(protocol, ec);
@@ -392,9 +525,9 @@ namespace remote_microphone {
       impl->socket.set_option(boost::asio::ip::v6_only(false), ec);
     }
     if (!ec) {
-      const auto bind_address = boost::asio::ip::make_address(net::get_bind_address(address_family), ec);
+      const auto bind_address = boost::asio::ip::make_address(port == 0 ? "127.0.0.1" : net::get_bind_address(address_family), ec);
       if (!ec) {
-        impl->socket.bind(boost::asio::ip::udp::endpoint {bind_address, net::map_port(STREAM_PORT)}, ec);
+        impl->socket.bind(boost::asio::ip::udp::endpoint {bind_address, port}, ec);
       }
     }
     if (!ec) {
@@ -405,11 +538,76 @@ namespace remote_microphone {
       return nullptr;
     }
 
-    auto session_id = impl->config.session_id;
-    BOOST_LOG(info) << "Encrypted remote microphone enabled on UDP port "sv << net::map_port(STREAM_PORT);
     auto session = std::unique_ptr<session_t> {new session_t {std::move(impl)}};
-    owner_session_id = session_id;
+    owner_guard.disable();
+
+    const auto handoff_deadline = std::chrono::steady_clock::now() + sink_handoff_grace;
+    while (gate.busy()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= handoff_deadline) {
+        break;
+      }
+      std::this_thread::sleep_until(std::min(handoff_deadline, now + sink_handoff_poll_interval));
+    }
+    if (!gate.try_run([sink_worker = std::move(sink_worker), sink_mailbox]() mutable {
+          sink_worker(std::move(sink_mailbox));
+        })) {
+      BOOST_LOG(warning) << "Remote microphone sink initialization is already pending"sv;
+      return nullptr;
+    }
+
     return session;
+  }
+
+  std::unique_ptr<session_t> start(session_config_t session_config) {
+#ifndef __APPLE__
+    return nullptr;
+#else
+    const auto port = net::map_port(STREAM_PORT);
+    const auto sink_uid = session_config.sink_uid;
+    return detail::start_for_testing(
+      std::move(session_config),
+      sink_initializer_gate(),
+      [port, sink_uid](std::shared_ptr<detail::sink_mailbox_t> sink_mailbox) {
+        try {
+          if (!platf::remote_microphone::available(sink_uid)) {
+            if (sink_mailbox->fail()) {
+              BOOST_LOG(error) << "Configured remote microphone output device is unavailable"sv;
+            }
+            return;
+          }
+
+          auto sink = platf::remote_microphone::make_sink(sink_uid);
+          if (!sink) {
+            if (sink_mailbox->fail()) {
+              BOOST_LOG(error) << "Failed to open configured remote microphone output device"sv;
+            }
+            return;
+          }
+          if (!sink_mailbox->activate()) {
+            return;
+          }
+
+          BOOST_LOG(info) << "Encrypted remote microphone enabled on UDP port "sv << port;
+          std::uint64_t sink_writes {};
+          std::uint64_t sink_drops {};
+          while (sink_mailbox->consume_frame([&sink, &sink_writes, &sink_drops](std::span<const std::int16_t> frame) {
+            if (sink->write(frame)) {
+              ++sink_writes;
+            } else {
+              ++sink_drops;
+            }
+          })) {
+          }
+          BOOST_LOG(info) << "Remote microphone sink stopped: writes="sv << sink_writes << ", drops="sv << sink_drops;
+        } catch (...) {
+          if (sink_mailbox->fail()) {
+            BOOST_LOG(error) << "Remote microphone sink initialization failed unexpectedly"sv;
+          }
+        }
+      },
+      port
+    );
 #endif
   }
 }  // namespace remote_microphone

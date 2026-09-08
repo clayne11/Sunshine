@@ -9,7 +9,12 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <future>
+#include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -21,6 +26,8 @@
 #include <src/remote_microphone.h>
 
 namespace {
+  using namespace std::chrono_literals;
+
   constexpr std::uint32_t test_key_id = 0x10203040;
 
   /**
@@ -203,4 +210,221 @@ TEST(RemoteMicrophoneSessionTests, RefusesDisabledOrUnencryptedSessionBeforeOpen
   config.encryption_negotiated = true;
   config.sink_uid.clear();
   EXPECT_EQ(remote_microphone::start(std::move(config)), nullptr);
+}
+
+TEST(RemoteMicrophoneSinkMailboxTests, CancellationPreventsLateActivationAndAudio) {
+  auto mailbox = std::make_shared<remote_microphone::detail::sink_mailbox_t>();
+  remote_microphone::detail::pcm_frame_t frame {};
+
+  EXPECT_FALSE(mailbox->write(frame));
+  mailbox->cancel();
+  EXPECT_EQ(mailbox->state(), remote_microphone::detail::sink_state_e::canceled);
+  EXPECT_FALSE(mailbox->activate());
+  EXPECT_FALSE(mailbox->fail());
+  EXPECT_FALSE(mailbox->write(frame));
+}
+
+TEST(RemoteMicrophoneSinkMailboxTests, KeepsOnlyNewestFrameWithoutAddingAWait) {
+  remote_microphone::detail::sink_mailbox_t mailbox;
+  remote_microphone::detail::pcm_frame_t first {};
+  remote_microphone::detail::pcm_frame_t newest {};
+  first.fill(1);
+  newest.fill(2);
+
+  ASSERT_TRUE(mailbox.activate());
+  EXPECT_TRUE(mailbox.write(first));
+  EXPECT_FALSE(mailbox.write(newest));
+
+  remote_microphone::detail::pcm_frame_t delivered {};
+  ASSERT_TRUE(mailbox.consume_frame([&](std::span<const std::int16_t> frame) {
+    std::ranges::copy(frame, delivered.begin());
+  }));
+  EXPECT_EQ(delivered, newest);
+}
+
+TEST(RemoteMicrophoneSinkMailboxTests, CancellationWakesAWaitingSinkWorker) {
+  auto mailbox = std::make_shared<remote_microphone::detail::sink_mailbox_t>();
+  ASSERT_TRUE(mailbox->activate());
+
+  auto waiter = std::async(std::launch::async, [mailbox]() {
+    return mailbox->consume_frame([](std::span<const std::int16_t>) {
+    });
+  });
+  mailbox->cancel();
+
+  ASSERT_EQ(waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(waiter.get());
+}
+
+TEST(RemoteMicrophoneInitializerGateTests, ContainsBlockedInitializerAndRejectsDuplicate) {
+  remote_microphone::detail::initializer_gate_t gate;
+  std::promise<void> started;
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+
+  ASSERT_TRUE(gate.try_run([&]() {
+    started.set_value();
+    release_future.wait();
+  }));
+  ASSERT_EQ(started.get_future().wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(gate.busy());
+  EXPECT_FALSE(gate.try_run([]() {
+  }));
+
+  release.set_value();
+  for (int attempt = 0; attempt < 1000 && gate.busy(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_FALSE(gate.busy());
+}
+
+TEST(RemoteMicrophoneInitializerGateTests, ReopensAfterCompletionOrException) {
+  remote_microphone::detail::initializer_gate_t gate;
+  std::promise<void> first_completed;
+  ASSERT_TRUE(gate.try_run([&]() {
+    first_completed.set_value();
+  }));
+  ASSERT_EQ(first_completed.get_future().wait_for(1s), std::future_status::ready);
+  for (int attempt = 0; attempt < 1000 && gate.busy(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+
+  std::promise<void> exception_started;
+  ASSERT_TRUE(gate.try_run([&]() {
+    exception_started.set_value();
+    throw 1;
+  }));
+  ASSERT_EQ(exception_started.get_future().wait_for(1s), std::future_status::ready);
+  for (int attempt = 0; attempt < 1000 && gate.busy(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_FALSE(gate.busy());
+}
+
+TEST(RemoteMicrophoneSessionTests, BlockedSinkInitializationCannotBlockTeardownOrPublishLateAudio) {
+  remote_microphone::detail::initializer_gate_t gate;
+  std::promise<void> started;
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  std::atomic_bool activated {true};
+  remote_microphone::session_config_t config {
+    .session_id = 2,
+    .client_address = boost::asio::ip::make_address("127.0.0.1"),
+    .key = make_key(),
+    .key_id = test_key_id,
+    .sink_uid = "blocked-test-device",
+    .encryption_negotiated = true,
+  };
+
+  auto session = remote_microphone::detail::start_for_testing(
+    std::move(config),
+    gate,
+    [&](std::shared_ptr<remote_microphone::detail::sink_mailbox_t> mailbox) {
+      started.set_value();
+      release_future.wait();
+      activated.store(mailbox->activate());
+    },
+    0
+  );
+  ASSERT_NE(session, nullptr);
+  ASSERT_EQ(started.get_future().wait_for(1s), std::future_status::ready);
+
+  const auto teardown_started = std::chrono::steady_clock::now();
+  session.reset();
+  EXPECT_LT(std::chrono::steady_clock::now() - teardown_started, 250ms);
+  EXPECT_TRUE(gate.busy());
+
+  remote_microphone::session_config_t retry_config {
+    .session_id = 5,
+    .client_address = boost::asio::ip::make_address("127.0.0.1"),
+    .key = make_key(),
+    .key_id = test_key_id,
+    .sink_uid = "blocked-retry-test-device",
+    .encryption_negotiated = true,
+  };
+  const auto retry_started = std::chrono::steady_clock::now();
+  auto retry_session = remote_microphone::detail::start_for_testing(
+    std::move(retry_config),
+    gate,
+    [](std::shared_ptr<remote_microphone::detail::sink_mailbox_t>) {
+    },
+    0
+  );
+  const auto retry_duration = std::chrono::steady_clock::now() - retry_started;
+  EXPECT_EQ(retry_session, nullptr);
+  EXPECT_GE(retry_duration, 400ms);
+  EXPECT_LT(retry_duration, 1s);
+
+  release.set_value();
+  for (int attempt = 0; attempt < 1000 && gate.busy(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_FALSE(gate.busy());
+  EXPECT_FALSE(activated.load());
+}
+
+TEST(RemoteMicrophoneSessionTests, ReconnectCanStartMicrophoneAfterCleanSinkShutdown) {
+  remote_microphone::detail::initializer_gate_t gate;
+  std::promise<void> first_activated;
+  std::promise<void> first_disposal_started;
+  remote_microphone::session_config_t first_config {
+    .session_id = 3,
+    .client_address = boost::asio::ip::make_address("127.0.0.1"),
+    .key = make_key(),
+    .key_id = test_key_id,
+    .sink_uid = "reconnect-test-device",
+    .encryption_negotiated = true,
+  };
+  auto first_session = remote_microphone::detail::start_for_testing(
+    std::move(first_config),
+    gate,
+    [&](std::shared_ptr<remote_microphone::detail::sink_mailbox_t> mailbox) {
+      if (mailbox->activate()) {
+        first_activated.set_value();
+        while (mailbox->consume_frame([](std::span<const std::int16_t>) {
+        })) {
+        }
+      }
+      first_disposal_started.set_value();
+      std::this_thread::sleep_for(100ms);
+    },
+    0
+  );
+  ASSERT_NE(first_session, nullptr);
+  ASSERT_EQ(first_activated.get_future().wait_for(1s), std::future_status::ready);
+  first_session.reset();
+  ASSERT_EQ(first_disposal_started.get_future().wait_for(1s), std::future_status::ready);
+  ASSERT_TRUE(gate.busy());
+
+  std::promise<void> second_activated;
+  remote_microphone::session_config_t second_config {
+    .session_id = 4,
+    .client_address = boost::asio::ip::make_address("127.0.0.1"),
+    .key = make_key(),
+    .key_id = test_key_id,
+    .sink_uid = "reconnect-test-device",
+    .encryption_negotiated = true,
+  };
+  const auto reconnect_started = std::chrono::steady_clock::now();
+  auto second_session = remote_microphone::detail::start_for_testing(
+    std::move(second_config),
+    gate,
+    [&](std::shared_ptr<remote_microphone::detail::sink_mailbox_t> mailbox) {
+      if (mailbox->activate()) {
+        second_activated.set_value();
+        while (mailbox->consume_frame([](std::span<const std::int16_t>) {
+        })) {
+        }
+      }
+    },
+    0
+  );
+  EXPECT_NE(second_session, nullptr);
+  EXPECT_LT(std::chrono::steady_clock::now() - reconnect_started, 500ms);
+  EXPECT_EQ(second_activated.get_future().wait_for(1s), std::future_status::ready);
+  second_session.reset();
+  for (int attempt = 0; attempt < 1000 && gate.busy(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_FALSE(gate.busy());
 }
