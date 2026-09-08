@@ -26,7 +26,7 @@ class SunshineServiceTest(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.recovery = self.root / "recovery"
-        self.runtime = self.home / "Applications/Sunshine Test.app/Contents/MacOS/Sunshine"
+        self.runtime = self.home / "Applications/Sunshine.app/Contents/MacOS/Sunshine"
         self.runtime.parent.mkdir(parents=True)
         self.runtime.write_text("#!/bin/sh\nexit 0\n")
         self.runtime.chmod(0o755)

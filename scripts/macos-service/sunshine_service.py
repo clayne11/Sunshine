@@ -98,11 +98,11 @@ def _path(value: str | Path, home: Path) -> Path:
 def _default_runtime(home: Path) -> Path:
     """Return the selected Sunshine app executable for this home directory."""
 
-    return home / "Applications/Sunshine Test.app/Contents/MacOS/Sunshine"
+    return home / "Applications/Sunshine.app/Contents/MacOS/Sunshine"
 
 
 def _default_config(home: Path) -> Path:
-    """Return the isolated Sunshine configuration used by the test app."""
+    """Return the isolated Sunshine configuration used by the direct app."""
 
     return home / ".config/sunshine-personal/config/sunshine.conf"
 
@@ -572,7 +572,7 @@ def _parser() -> argparse.ArgumentParser:
     operation.add_argument("--activate", action="store_true", help="write the plist and mutate launchd")
     operation.add_argument("--rollback", metavar="MANIFEST", help="restore an activation manifest")
     parser.add_argument("--home", help=argparse.SUPPRESS)
-    parser.add_argument("--runtime", help="Sunshine executable (default: Sunshine Test app)")
+    parser.add_argument("--runtime", help="Sunshine executable (default: Sunshine.app)")
     parser.add_argument("--config", help="Sunshine config path")
     parser.add_argument("--recovery-dir", help="staging and rollback root")
     parser.add_argument("--web-port", type=int, default=DEFAULT_WEB_PORT, help="documented UI port")
