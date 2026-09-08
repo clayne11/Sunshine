@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -47,6 +48,51 @@ namespace nvhttp {
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
+
+  namespace {
+    /**
+     * @brief Log one GameStream request without exposing its query parameters.
+     * @details The sequence number correlates request entry and completion while
+     *          elapsed time identifies work that blocks the single HTTPS worker.
+     */
+    class request_timing_t {
+    public:
+      /**
+       * @brief Start timing a request for a fixed endpoint name.
+       * @param endpoint Endpoint path without a query string.
+       */
+      explicit request_timing_t(std::string_view endpoint):
+          id_ {++next_id_},
+          endpoint_ {endpoint},
+          started_at_ {std::chrono::steady_clock::now()} {
+        BOOST_LOG(info) << "GameStream request ["sv << id_ << "] "sv << endpoint_ << " started"sv;
+      }
+
+      /**
+       * @brief Log request completion and elapsed wall-clock time.
+       */
+      ~request_timing_t() {
+        const auto elapsed {std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at_)};
+        BOOST_LOG(info) << "GameStream request ["sv << id_ << "] "sv << endpoint_ << " completed in "sv << elapsed.count() << " ms"sv;
+      }
+
+      /**
+       * @brief Request timers cannot be copied because each instance owns one completion record.
+       */
+      request_timing_t(const request_timing_t &) = delete;
+      /**
+       * @brief Request timers cannot be reassigned because their endpoint and start time are fixed.
+       * @return This timer is never reassigned.
+       */
+      request_timing_t &operator=(const request_timing_t &) = delete;
+
+    private:
+      inline static std::atomic_uint64_t next_id_ {};  ///< Monotonic process-local request identifier.
+      std::uint64_t id_;  ///< Identifier shared by the entry and completion records.
+      std::string_view endpoint_;  ///< Fixed endpoint path that excludes private query data.
+      std::chrono::steady_clock::time_point started_at_;  ///< Monotonic request start time.
+    };
+  }  // namespace
 
   crypto::cert_chain_t cert_chain;  ///< Enabled paired-client certificates accepted by Sunshine's GameStream HTTPS server.
 
@@ -1155,6 +1201,7 @@ namespace nvhttp {
    */
   template<class T>
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    request_timing_t request_timing {"/serverinfo"sv};
     print_req<T>(request);
 
     int pair_status = 0;
@@ -1279,6 +1326,8 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+    request_timing_t request_timing {"/launch"sv};
+    rtsp_stream::launch_transition_guard_t launch_transition {config::video.virtual_display};
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1424,6 +1473,8 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+    request_timing_t request_timing {"/resume"sv};
+    rtsp_stream::launch_transition_guard_t launch_transition {config::video.virtual_display};
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1551,6 +1602,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void cancel(resp_https_t response, req_https_t request) {
+    request_timing_t request_timing {"/cancel"sv};
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;

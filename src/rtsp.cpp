@@ -42,6 +42,28 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace rtsp_stream {
+  namespace {
+    std::recursive_mutex launch_transition_mutex;  ///< Orders virtual-display reuse against teardown and timeout cleanup.
+  }
+
+  launch_transition_guard_t::launch_transition_guard_t(bool enabled):
+      lock_ {launch_transition_mutex, std::defer_lock} {
+    if (enabled) {
+      lock_.lock();
+    }
+  }
+
+  /**
+   * @brief Decide whether timeout cleanup must release an inherited virtual display.
+   * @param virtual_display_enabled Whether the session uses a temporary virtual display.
+   * @param owner_released Whether owner-specific cleanup released the display.
+   * @param active_session_count Number of sessions that can still use the display.
+   * @return True when globally releasing an unowned display is safe and required.
+   */
+  bool should_force_virtual_display_cleanup(bool virtual_display_enabled, bool owner_released, int active_session_count) {
+    return virtual_display_enabled && !owner_released && active_session_count == 0;
+  }
+
   /**
    * @brief Release msg resources.
    *
@@ -609,6 +631,7 @@ namespace rtsp_stream {
       raised_timer.expires_after(config::stream.ping_timeout);
       raised_timer.async_wait([this, launch_session_id](const boost::system::error_code &ec) {
         if (!ec) {
+          launch_transition_guard_t transition {config::video.virtual_display};
           std::shared_ptr<launch_session_t> discarded;
           {
             std::lock_guard lock {_launch_mutex};
@@ -619,8 +642,14 @@ namespace rtsp_stream {
           }
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
-            if (session_count() == 0) {
-              (void) display_device::destroy_virtual_display(discarded->id);
+            const auto active_session_count = session_count();
+            if (active_session_count == 0) {
+              const auto owner_released = display_device::destroy_virtual_display(discarded->id);
+              if (should_force_virtual_display_cleanup(config::video.virtual_display, owner_released, active_session_count)) {
+                // A reconnect can reuse a display owned by the session that just
+                // stopped. With no active or pending session, it is now stale.
+                display_device::destroy_virtual_display();
+              }
             }
           }
         }
@@ -656,6 +685,15 @@ namespace rtsp_stream {
       return (int) _session_slots->size();
     }
 
+    /**
+     * @brief Check whether a launch session is waiting for RTSP setup.
+     * @return True while a launch event remains pending.
+     */
+    [[nodiscard]] bool session_pending() {
+      std::lock_guard lock {_launch_mutex};
+      return launch_event.view(0s) != nullptr;
+    }
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
@@ -681,6 +719,7 @@ namespace rtsp_stream {
      * @examples_end
      */
     void clear(bool all = true) {
+      launch_transition_guard_t transition {config::video.virtual_display};
       if (all) {
         clear_pending();
       }
@@ -699,6 +738,11 @@ namespace rtsp_stream {
           }
         }
       }
+      if (all && config::video.virtual_display && session_count() == 0) {
+        // Owner-specific cleanup can miss a display inherited by a reconnect.
+        // The transition lock proves no launch can reserve it concurrently.
+        display_device::destroy_virtual_display();
+      }
     }
 
     /**
@@ -707,6 +751,7 @@ namespace rtsp_stream {
      * @param cert Certificate data or object used by the operation.
      */
     void clear_by_cert(std::string_view cert) {
+      launch_transition_guard_t transition {config::video.virtual_display};
       auto lg = _session_slots.lock();
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
         auto &slot = *(*i);
@@ -789,6 +834,10 @@ namespace rtsp_stream {
    */
   bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
     return server.session_raise(std::move(launch_session));
+  }
+
+  bool launch_session_pending() {
+    return server.session_pending();
   }
 
   void launch_session_clear(uint32_t launch_session_id) {

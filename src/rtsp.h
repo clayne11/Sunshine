@@ -6,6 +6,7 @@
 
 // standard includes
 #include <atomic>
+#include <mutex>
 
 // local includes
 #include "crypto.h"
@@ -47,12 +48,34 @@ namespace rtsp_stream {
   };
 
   /**
+   * @brief Serialize virtual-display launch decisions with session teardown.
+   * @details Disabled guards do not lock, preserving the existing physical-display path.
+   */
+  class launch_transition_guard_t {
+  public:
+    /**
+     * @brief Lock the launch transition when virtual-display coordination is required.
+     * @param enabled Whether to acquire the process-wide transition lock.
+     */
+    explicit launch_transition_guard_t(bool enabled);
+
+  private:
+    std::unique_lock<std::recursive_mutex> lock_;  ///< Held transition lock, or an unlocked guard when disabled.
+  };
+
+  /**
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
    * @return True when queued; false when another launch session is already pending.
    */
   [[nodiscard]] bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+
+  /**
+   * @brief Check whether a client launch is waiting for its RTSP connection.
+   * @return True while a launch session is pending.
+   */
+  [[nodiscard]] bool launch_session_pending();
 
   /**
    * @brief Clear state for the specified launch session.

@@ -31,6 +31,7 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -2238,6 +2239,9 @@ namespace stream {
 
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
+        const bool preserve_virtual_display {
+          config::video.virtual_display && rtsp_stream::launch_session_pending()
+        };
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
         if (proc::proc.running()) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
@@ -2249,11 +2253,13 @@ namespace stream {
           input::terminate_gamepads();
         }
 
-        if (revert_display_config) {
+        if (revert_display_config && !preserve_virtual_display) {
           display_device::revert_configuration();
         }
 
-        platf::streaming_will_stop();
+        if (!preserve_virtual_display) {
+          platf::streaming_will_stop();
+        }
       }
 
       BOOST_LOG(debug) << "Session ended"sv;
