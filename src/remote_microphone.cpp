@@ -9,12 +9,18 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <sstream>
+#include <string_view>
 #include <thread>
+#include <utility>
 
 // lib includes
 #include <boost/asio.hpp>
@@ -26,6 +32,7 @@
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#include "remote_microphone_diagnostics.h"
 #include "utility.h"
 
 #ifdef __APPLE__
@@ -49,6 +56,9 @@ namespace remote_microphone {
     constexpr std::size_t sink_mailbox_frames = 1;
     constexpr auto sink_handoff_grace = 500ms;  ///< Maximum wait for normal sink disposal during reconnect.
     constexpr auto sink_handoff_poll_interval = 5ms;  ///< Poll interval while the previous sink worker exits.
+    constexpr auto initial_diagnostics_interval = 10s;  ///< Receiver reporting interval during the first minute.
+    constexpr auto steady_diagnostics_interval = 30s;  ///< Receiver reporting interval after the first minute.
+    constexpr auto initial_diagnostics_period = 60s;  ///< Duration of more frequent receiver reporting.
 
     std::mutex owner_mutex;  ///< Serializes single-owner admission and release.
     std::uint32_t owner_session_id {};  ///< Session currently permitted to receive microphone data.
@@ -99,7 +109,166 @@ namespace remote_microphone {
       static auto *gate = new detail::initializer_gate_t;
       return *gate;
     }
+
+    /**
+     * @brief Merge a diagnostics delta into one aggregate.
+     * @param destination Aggregate to update.
+     * @param delta Counters and measurements to add.
+     */
+    void merge_diagnostics(detail::microphone_diagnostics_snapshot_t &destination, const detail::microphone_diagnostics_snapshot_t &delta) noexcept {
+      destination.received += delta.received;
+      destination.accepted += delta.accepted;
+      destination.rejected += delta.rejected;
+      destination.opus_mono += delta.opus_mono;
+      destination.opus_stereo += delta.opus_stereo;
+      destination.packet_frames += delta.packet_frames;
+      destination.plc_frames += delta.plc_frames;
+      destination.synthetic_zero_frames += delta.synthetic_zero_frames;
+      destination.reanchors += delta.reanchors;
+      destination.jitter_overflows += delta.jitter_overflows;
+      destination.late_or_replayed += delta.late_or_replayed;
+      destination.skipped_frames += delta.skipped_frames;
+      destination.sink_drops += delta.sink_drops;
+      destination.pcm_samples += delta.pcm_samples;
+      destination.pcm_zero_samples += delta.pcm_zero_samples;
+      destination.pcm_clipped_samples += delta.pcm_clipped_samples;
+      destination.pcm_peak = std::max(destination.pcm_peak, delta.pcm_peak);
+      destination.pcm_square_sum += delta.pcm_square_sum;
+      destination.max_schedule_gap = std::max(destination.max_schedule_gap, delta.max_schedule_gap);
+      destination.max_arrival_gap = std::max(destination.max_arrival_gap, delta.max_arrival_gap);
+      destination.max_client_timestamp_delta_ms = std::max(destination.max_client_timestamp_delta_ms, delta.max_client_timestamp_delta_ms);
+    }
+
+    /**
+     * @brief Log aggregate receiver diagnostics without packet or audio contents.
+     * @param scope Reporting scope label.
+     * @param duration Time represented by the aggregate.
+     * @param value Aggregate diagnostic values.
+     */
+    void log_receive_diagnostics(std::string_view scope, std::chrono::steady_clock::duration duration, const detail::microphone_diagnostics_snapshot_t &value) {
+      std::ostringstream message;
+      message << std::fixed << std::setprecision(4)
+              << "Remote microphone receive diagnostics (" << scope << ", "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() << " ms): received=" << value.received
+              << ", accepted=" << value.accepted << ", rejected=" << value.rejected
+              << ", opus_mono=" << value.opus_mono << ", opus_stereo=" << value.opus_stereo
+              << ", packet_frames=" << value.packet_frames << ", plc_frames=" << value.plc_frames
+              << ", synthetic_zero_frames=" << value.synthetic_zero_frames << ", reanchors=" << value.reanchors
+              << ", jitter_overflows=" << value.jitter_overflows << ", late_or_replayed=" << value.late_or_replayed
+              << ", skipped_frames=" << value.skipped_frames << ", sink_drops=" << value.sink_drops
+              << ", packet_pcm_peak_int16=" << value.pcm_peak << ", packet_pcm_rms_int16=" << value.pcm_rms()
+              << ", packet_pcm_zero_fraction=" << value.pcm_zero_fraction()
+              << ", packet_pcm_clipped_fraction=" << value.pcm_clipped_fraction()
+              << ", max_schedule_gap_ms=" << std::chrono::duration<double, std::milli> {value.max_schedule_gap}.count()
+              << ", max_arrival_gap_ms=" << value.max_arrival_gap.count()
+              << ", max_client_timestamp_delta_ms=" << value.max_client_timestamp_delta_ms;
+      BOOST_LOG(info) << message.str();
+    }
   }  // namespace
+
+  double detail::microphone_diagnostics_snapshot_t::pcm_rms() const noexcept {
+    return pcm_samples == 0 ? 0.0 : std::sqrt(static_cast<double>(pcm_square_sum / static_cast<long double>(pcm_samples)));
+  }
+
+  double detail::microphone_diagnostics_snapshot_t::pcm_zero_fraction() const noexcept {
+    return pcm_samples == 0 ? 0.0 : static_cast<double>(pcm_zero_samples) / static_cast<double>(pcm_samples);
+  }
+
+  double detail::microphone_diagnostics_snapshot_t::pcm_clipped_fraction() const noexcept {
+    return pcm_samples == 0 ? 0.0 : static_cast<double>(pcm_clipped_samples) / static_cast<double>(pcm_samples);
+  }
+
+  void detail::microphone_diagnostics_t::record_received() noexcept {
+    ++interval_.received;
+    ++totals_.received;
+  }
+
+  void detail::microphone_diagnostics_t::record_rejected(bool late_or_replayed) noexcept {
+    ++interval_.rejected;
+    ++totals_.rejected;
+    if (late_or_replayed) {
+      ++interval_.late_or_replayed;
+      ++totals_.late_or_replayed;
+    }
+  }
+
+  void detail::microphone_diagnostics_t::record_accepted(std::span<const std::uint8_t> opus, std::uint32_t client_timestamp_ms, std::int64_t extended_sequence, std::chrono::steady_clock::time_point arrival) noexcept {
+    microphone_diagnostics_snapshot_t delta;
+    delta.accepted = 1;
+    if (!opus.empty()) {
+      ((opus.front() & 0x04u) == 0 ? delta.opus_mono : delta.opus_stereo) = 1;
+    }
+    if (extended_sequence > last_extended_sequence_) {
+      if (last_extended_sequence_ >= 0) {
+        delta.max_arrival_gap = std::chrono::duration_cast<std::chrono::milliseconds>(arrival - last_arrival_);
+        delta.max_client_timestamp_delta_ms = client_timestamp_ms - last_client_timestamp_ms_;
+      }
+      last_extended_sequence_ = extended_sequence;
+      last_client_timestamp_ms_ = client_timestamp_ms;
+      last_arrival_ = arrival;
+    }
+    merge_diagnostics(interval_, delta);
+    merge_diagnostics(totals_, delta);
+  }
+
+  void detail::microphone_diagnostics_t::record_frame(microphone_frame_source_e source, std::span<const std::int16_t> pcm) noexcept {
+    microphone_diagnostics_snapshot_t delta;
+    if (source == microphone_frame_source_e::packet) {
+      delta.packet_frames = 1;
+      delta.pcm_samples = pcm.size();
+      for (const auto sample : pcm) {
+        const auto widened = static_cast<std::int32_t>(sample);
+        const auto magnitude = static_cast<std::uint32_t>(widened < 0 ? -widened : widened);
+        delta.pcm_peak = std::max(delta.pcm_peak, magnitude);
+        delta.pcm_zero_samples += sample == 0;
+        delta.pcm_clipped_samples += sample == std::numeric_limits<std::int16_t>::min() || sample == std::numeric_limits<std::int16_t>::max();
+        const auto floating_sample = static_cast<long double>(sample);
+        delta.pcm_square_sum += floating_sample * floating_sample;
+      }
+    } else if (source == microphone_frame_source_e::plc) {
+      delta.plc_frames = 1;
+    } else {
+      delta.synthetic_zero_frames = 1;
+    }
+    merge_diagnostics(interval_, delta);
+    merge_diagnostics(totals_, delta);
+  }
+
+  void detail::microphone_diagnostics_t::record_reanchor() noexcept {
+    ++interval_.reanchors;
+    ++totals_.reanchors;
+    last_extended_sequence_ = -1;
+    last_client_timestamp_ms_ = 0;
+    last_arrival_ = {};
+  }
+
+  void detail::microphone_diagnostics_t::record_jitter_overflow() noexcept {
+    ++interval_.jitter_overflows;
+    ++totals_.jitter_overflows;
+  }
+
+  void detail::microphone_diagnostics_t::record_skipped(std::uint64_t count) noexcept {
+    interval_.skipped_frames += count;
+    totals_.skipped_frames += count;
+  }
+
+  void detail::microphone_diagnostics_t::record_sink_drop() noexcept {
+    ++interval_.sink_drops;
+    ++totals_.sink_drops;
+  }
+
+  void detail::microphone_diagnostics_t::record_schedule_gap(std::chrono::nanoseconds gap) noexcept {
+    interval_.max_schedule_gap = std::max(interval_.max_schedule_gap, gap);
+    totals_.max_schedule_gap = std::max(totals_.max_schedule_gap, gap);
+  }
+
+  detail::microphone_diagnostics_snapshot_t detail::microphone_diagnostics_t::take_interval() noexcept {
+    return std::exchange(interval_, {});
+  }
+
+  detail::microphone_diagnostics_snapshot_t detail::microphone_diagnostics_t::totals() const noexcept {
+    return totals_;
+  }
 
   struct detail::sink_mailbox_t::impl_t {
     mutable std::mutex mutex;  ///< Serializes state and queued audio.
@@ -333,6 +502,7 @@ namespace remote_microphone {
     std::uint64_t accepted_packets {};  ///< Valid peer packets admitted to the jitter queue.
     std::uint64_t rejected_packets {};  ///< Packets rejected by peer, format, crypto, or replay checks.
     std::uint64_t sink_drops {};  ///< Decoded frames refused by the selected audio sink.
+    detail::microphone_diagnostics_t diagnostics;  ///< Aggregate receiver quality diagnostics.
 
     /**
      * @brief Construct initialized receiver state.
@@ -357,6 +527,10 @@ namespace remote_microphone {
       std::array<std::uint8_t, 2048> receive_buffer;
       boost::asio::ip::udp::endpoint source;
       std::array<std::int16_t, FRAME_SAMPLES> pcm;
+      const auto session_started = std::chrono::steady_clock::now();
+      auto last_checkpoint = session_started;
+      auto last_diagnostics_report = session_started;
+      auto next_diagnostics_report = session_started + initial_diagnostics_interval;
 
       while (!stop_token.stop_requested()) {
         if (sink_mailbox->state() == detail::sink_state_e::failed) {
@@ -372,6 +546,7 @@ namespace remote_microphone {
           if (ec) {
             if (ec == boost::asio::error::message_size) {
               ++rejected_packets;
+              diagnostics.record_rejected();
               continue;
             }
             if (ec != boost::asio::error::operation_aborted || !stop_token.stop_requested()) {
@@ -382,21 +557,26 @@ namespace remote_microphone {
           }
 
           ++received_packets;
+          diagnostics.record_received();
           if (net::normalize_address(source.address()) != net::normalize_address(config.client_address)) {
             ++rejected_packets;
+            diagnostics.record_rejected();
             continue;
           }
           auto packet = decrypt_packet(std::span {receive_buffer.data(), bytes}, cipher, config.key_id);
           if (!packet) {
             ++rejected_packets;
+            diagnostics.record_rejected();
             continue;
           }
           auto sequence = detail::admit_for_playout(sequence_window, packet->sequence, next_playout_sequence, packets.empty(), playout_silent);
           if (!sequence) {
             ++rejected_packets;
+            diagnostics.record_rejected(true);
             continue;
           }
           if (sequence->reanchored) {
+            diagnostics.record_reanchor();
             packets.clear();
             next_playout_sequence.reset();
             next_playout_time.reset();
@@ -404,8 +584,10 @@ namespace remote_microphone {
             playout_silent = false;
             (void) opus_decoder_ctl(decoder.get(), OPUS_RESET_STATE);
           }
+          diagnostics.record_accepted(packet->opus_payload, packet->timestamp_ms, sequence->extended_sequence, std::chrono::steady_clock::now());
           packets.emplace(sequence->extended_sequence, std::move(packet->opus_payload));
           if (packets.size() > max_buffered_packets) {
+            diagnostics.record_jitter_overflow();
             packets.erase(std::prev(packets.end()));
           }
           if (!next_playout_sequence) {
@@ -416,34 +598,43 @@ namespace remote_microphone {
         }
 
         const auto now = std::chrono::steady_clock::now();
+        diagnostics.record_schedule_gap(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_checkpoint));
+        last_checkpoint = now;
         if (next_playout_time && now >= *next_playout_time) {
           const auto packet = packets.find(*next_playout_sequence);
           int decoded_samples;
+          auto frame_source = detail::microphone_frame_source_e::packet;
           if (packet != packets.end()) {
             decoded_samples = opus_decode(decoder.get(), packet->second.data(), static_cast<opus_int32>(packet->second.size()), pcm.data(), static_cast<int>(pcm.size()), 0);
             packets.erase(packet);
             consecutive_plc_frames = 0;
             playout_silent = false;
           } else if (consecutive_plc_frames < max_consecutive_plc_frames) {
+            frame_source = detail::microphone_frame_source_e::plc;
             decoded_samples = opus_decode(decoder.get(), nullptr, 0, pcm.data(), static_cast<int>(pcm.size()), 0);
             ++consecutive_plc_frames;
           } else {
+            frame_source = detail::microphone_frame_source_e::synthetic_zero;
             pcm.fill(0);
             decoded_samples = static_cast<int>(pcm.size());
             playout_silent = true;
           }
 
           if (decoded_samples == static_cast<int>(pcm.size())) {
+            diagnostics.record_frame(frame_source, pcm);
             if (!sink_mailbox->write(pcm)) {
               ++sink_drops;
+              diagnostics.record_sink_drop();
             }
           } else {
             ++rejected_packets;
+            diagnostics.record_rejected();
           }
           ++*next_playout_sequence;
           *next_playout_time += 20ms;
           if (now >= *next_playout_time) {
             const auto skipped_frames = static_cast<std::int64_t>((now - *next_playout_time) / 20ms) + 1;
+            diagnostics.record_skipped(static_cast<std::uint64_t>(skipped_frames));
             *next_playout_sequence += skipped_frames;
             *next_playout_time += 20ms * skipped_frames;
             std::erase_if(packets, [&](const auto &entry) {
@@ -455,6 +646,12 @@ namespace remote_microphone {
           }
         }
 
+        if (now >= next_diagnostics_report) {
+          log_receive_diagnostics("interval", now - last_diagnostics_report, diagnostics.take_interval());
+          last_diagnostics_report = now;
+          next_diagnostics_report = now + (now - session_started < initial_diagnostics_period ? initial_diagnostics_interval : steady_diagnostics_interval);
+        }
+
         if (receive_failed) {
           break;
         }
@@ -462,6 +659,8 @@ namespace remote_microphone {
         std::this_thread::sleep_for(1ms);
       }
 
+      const auto session_ended = std::chrono::steady_clock::now();
+      log_receive_diagnostics("session", session_ended - session_started, diagnostics.totals());
       BOOST_LOG(info) << "Remote microphone stopped: received="sv << received_packets
                       << ", accepted="sv << accepted_packets
                       << ", rejected="sv << rejected_packets
@@ -598,6 +797,7 @@ namespace remote_microphone {
               ++sink_drops;
             }
           })) {
+            sink->report_telemetry();
           }
           BOOST_LOG(info) << "Remote microphone sink stopped: writes="sv << sink_writes << ", drops="sv << sink_drops;
         } catch (...) {

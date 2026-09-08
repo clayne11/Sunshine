@@ -8,10 +8,13 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AudioUnit.h>
 #import <CoreAudio/CoreAudio.h>
+#include <mach/mach_time.h>
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <new>
 #include <vector>
@@ -27,6 +30,31 @@ namespace platf::remote_microphone {
   namespace {
     constexpr Float64 kSampleRate = 48000.0;  ///< Remote microphone sample rate.
     constexpr UInt32 kChannels = 2;  ///< Stereo output channel count.
+    constexpr auto kTelemetryEarlyWindow = std::chrono::seconds {60};  ///< Initial interval during which sink reports are more frequent.
+    constexpr auto kTelemetryEarlyReportInterval = std::chrono::seconds {10};  ///< Minimum interval between early sink reports.
+    constexpr auto kTelemetryReportInterval = std::chrono::seconds {30};  ///< Minimum interval between steady-state sink reports.
+
+    /**
+     * @brief Return the actual callback-entry timestamp for gap measurement.
+     * @return Mach absolute-time ticks sampled at callback entry.
+     */
+    std::uint64_t callback_host_time() noexcept {
+      return mach_absolute_time();
+    }
+
+    /**
+     * @brief Convert mach absolute-time ticks to milliseconds for reporting.
+     * @param ticks Mach absolute-time ticks.
+     * @return Elapsed milliseconds, or zero when the timebase is unavailable.
+     */
+    double ticks_to_milliseconds(std::uint64_t ticks) noexcept {
+      mach_timebase_info_data_t timebase {};
+      if (ticks == 0 || mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.denom == 0) {
+        return 0.0;
+      }
+      const auto nanoseconds = static_cast<long double>(ticks) * timebase.numer / timebase.denom;
+      return static_cast<double>(nanoseconds / 1'000'000.0L);
+    }
 
     /**
      * @brief Find a Core Audio device by exact UID.
@@ -173,6 +201,7 @@ namespace platf::remote_microphone {
         if (outputUnit_) {
           AudioComponentInstanceDispose(outputUnit_);
         }
+        report_telemetry(true);
       }
 
       /**
@@ -186,10 +215,24 @@ namespace platf::remote_microphone {
        * @brief Convert and queue a mono microphone chunk.
        */
       bool write(std::span<const std::int16_t> mono48k) override {
-        if (!ready_ || (requiresProcessExclusion_ && !platf::system_audio_tap_excludes_sunshine())) {
+        if (!ready_) {
+          telemetry_.record_input_rejection(mono48k.size());
           return false;
         }
-        return ring_.write(mono48k);
+        if (requiresProcessExclusion_ && !platf::system_audio_tap_excludes_sunshine()) {
+          telemetry_.record_input_rejection(mono48k.size());
+          return false;
+        }
+        const auto written_samples = ring_.write_count(mono48k);
+        telemetry_.record_ring_write(written_samples, mono48k.size() - written_samples);
+        return written_samples == mono48k.size();
+      }
+
+      /**
+       * @brief Emit rate-limited sink telemetry from a worker context.
+       */
+      void report_telemetry() override {
+        report_telemetry(false);
       }
 
     private:
@@ -198,7 +241,14 @@ namespace platf::remote_microphone {
        */
       static OSStatus render_callback(void *refCon, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32 frameCount, AudioBufferList *ioData) noexcept {
         auto *sink = static_cast<hal_sink_t *>(refCon);
-        if (!sink || !ioData || ioData->mNumberBuffers == 0) {
+        if (!sink) {
+          return noErr;
+        }
+
+        sink->telemetry_.record_callback(frameCount, callback_host_time());
+        if (!ioData || ioData->mNumberBuffers == 0) {
+          sink->telemetry_.record_format_anomaly();
+          sink->telemetry_.record_render(0, frameCount);
           return noErr;
         }
 
@@ -208,19 +258,62 @@ namespace platf::remote_microphone {
           }
         }
 
+        bool format_anomaly = ioData->mNumberBuffers > 2;
+        if (ioData->mNumberBuffers == 1) {
+          const auto &buffer = ioData->mBuffers[0];
+          format_anomaly = format_anomaly || !buffer.mData || buffer.mNumberChannels != kChannels || buffer.mDataByteSize < static_cast<std::size_t>(frameCount) * kChannels * sizeof(float);
+        } else if (ioData->mNumberBuffers >= 2) {
+          const auto &left = ioData->mBuffers[0];
+          const auto &right = ioData->mBuffers[1];
+          format_anomaly = format_anomaly || !left.mData || !right.mData || left.mNumberChannels != 1 || right.mNumberChannels != 1 || left.mDataByteSize < static_cast<std::size_t>(frameCount) * sizeof(float) || right.mDataByteSize < static_cast<std::size_t>(frameCount) * sizeof(float);
+        }
+        if (format_anomaly) {
+          sink->telemetry_.record_format_anomaly();
+        }
+
         if (sink->requiresProcessExclusion_ && !platf::system_audio_tap_excludes_sunshine()) {
+          sink->telemetry_.record_exclusion_mute(frameCount);
           sink->ring_.discard();
           return noErr;
         }
 
+        UInt32 read_frames = 0;
         if (ioData->mNumberBuffers == 1 && ioData->mBuffers[0].mData) {
           const auto capacity = static_cast<UInt32>(ioData->mBuffers[0].mDataByteSize / (detail::pcm_ring_t::channels * sizeof(float)));
-          sink->ring_.read_interleaved(static_cast<float *>(ioData->mBuffers[0].mData), std::min(frameCount, capacity));
+          read_frames = sink->ring_.read_interleaved(static_cast<float *>(ioData->mBuffers[0].mData), std::min(frameCount, capacity));
         } else if (ioData->mNumberBuffers >= 2 && ioData->mBuffers[0].mData && ioData->mBuffers[1].mData) {
           const auto capacity = static_cast<UInt32>(std::min(ioData->mBuffers[0].mDataByteSize, ioData->mBuffers[1].mDataByteSize) / sizeof(float));
-          sink->ring_.read_planar(static_cast<float *>(ioData->mBuffers[0].mData), static_cast<float *>(ioData->mBuffers[1].mData), std::min(frameCount, capacity));
+          read_frames = sink->ring_.read_planar(static_cast<float *>(ioData->mBuffers[0].mData), static_cast<float *>(ioData->mBuffers[1].mData), std::min(frameCount, capacity));
         }
+        sink->telemetry_.record_render(read_frames, frameCount - read_frames);
         return noErr;
+      }
+
+      /**
+       * @brief Report telemetry when forced or after the periodic interval.
+       * @param force Emit a final report even when the interval has not elapsed.
+       */
+      void report_telemetry(bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force) {
+          const auto since_start = now - telemetry_started_at_;
+          const auto interval = since_start < kTelemetryEarlyWindow ? kTelemetryEarlyReportInterval : kTelemetryReportInterval;
+          const auto since_last = last_telemetry_report_ == std::chrono::steady_clock::time_point {} ? since_start : now - last_telemetry_report_;
+          if (since_last < interval) {
+            return;
+          }
+        }
+        last_telemetry_report_ = now;
+        BOOST_LOG(info) << "Remote microphone sink telemetry: callbacks=" << telemetry_.callback_count.load(std::memory_order_relaxed)
+                        << ", requested_frames=" << telemetry_.callback_requested_frames.load(std::memory_order_relaxed)
+                        << ", read_frames=" << telemetry_.callback_read_frames.load(std::memory_order_relaxed)
+                        << ", underrun_frames=" << telemetry_.callback_underrun_frames.load(std::memory_order_relaxed)
+                        << ", max_callback_gap_ms=" << ticks_to_milliseconds(telemetry_.callback_max_gap_ticks.load(std::memory_order_relaxed))
+                        << ", format_anomalies=" << telemetry_.format_anomalies.load(std::memory_order_relaxed)
+                        << ", exclusion_muted_frames=" << telemetry_.exclusion_muted_frames.load(std::memory_order_relaxed)
+                        << ", ring_written_samples=" << telemetry_.ring_written_samples.load(std::memory_order_relaxed)
+                        << ", ring_dropped_samples=" << telemetry_.ring_dropped_samples.load(std::memory_order_relaxed)
+                        << ", input_rejected_samples=" << telemetry_.input_rejected_samples.load(std::memory_order_relaxed);
       }
 
       /**
@@ -295,10 +388,13 @@ namespace platf::remote_microphone {
       AudioDeviceID device_ {kAudioObjectUnknown};  ///< Explicit Core Audio output device ID.
       AudioUnit outputUnit_ {};  ///< HAL output unit pinned to device_.
       detail::pcm_ring_t ring_;  ///< Bounded producer-to-render PCM ring.
+      detail::sink_telemetry_t telemetry_;  ///< Lock-free callback and ring counters.
       bool initialized_ {false};  ///< Whether AudioUnitInitialize succeeded.
       bool started_ {false};  ///< Whether AudioOutputUnitStart succeeded.
       bool ready_ {false};  ///< Whether the sink can accept remote microphone samples.
       bool requiresProcessExclusion_ {false};  ///< Whether writes require a safe system-tap exclusion.
+      std::chrono::steady_clock::time_point telemetry_started_at_ {std::chrono::steady_clock::now()};  ///< Start of the sink telemetry schedule.
+      std::chrono::steady_clock::time_point last_telemetry_report_ {};  ///< Last periodic report time, accessed outside the render callback.
     };
   }  // namespace
 

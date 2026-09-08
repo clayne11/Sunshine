@@ -61,6 +61,14 @@ Host-side buffering does not provide acoustic echo cancellation. With the
 client's speakers playing, test conversational audio for echo as well as delay;
 the client and receiving app's audio processing affect the result.
 
+Sunshine logs aggregate receiver diagnostics every 10 seconds for the first
+minute, every 30 seconds afterward, and once at teardown. These counters report
+packet channel mode, real/PLC/synthetic frames, queue and scheduling gaps, and
+real decoded PCM peak and RMS in signed 16-bit sample units plus zero and clipped
+fractions. Client timestamps are wrapping monotonic milliseconds rather than
+audio sample timestamps. The logs never include packet payloads, PCM samples,
+session keys, or client addresses.
+
 ## Validation before release
 
 Unit tests cover malformed and encrypted packets, ordering, replay rejection,

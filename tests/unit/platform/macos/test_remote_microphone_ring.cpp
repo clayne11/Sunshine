@@ -69,6 +69,16 @@ TEST(RemoteMicrophoneRing, FullRingBoundsQueuedAudio) {
 }
 
 /**
+ * @brief Test that a partial ring write reports accepted samples precisely.
+ */
+TEST(RemoteMicrophoneRing, ReportsPartialWriteCount) {
+  pcm_ring_t ring;
+  const std::vector<std::int16_t> queued(pcm_ring_t::capacity_frames + 10, 1000);
+
+  EXPECT_EQ(ring.write_count(queued), pcm_ring_t::capacity_frames);
+}
+
+/**
  * @brief Test that muting the output discards frames queued before the mute.
  */
 TEST(RemoteMicrophoneRing, DiscardClearsQueuedAudio) {

@@ -7,6 +7,7 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -61,11 +62,24 @@ namespace platf::remote_microphone::detail {
      * @return True when every input sample was queued.
      */
     bool write(std::span<const std::int16_t> mono) noexcept {
+      return write_count(mono) == mono.size();
+    }
+
+    /**
+     * @brief Convert and queue as many mono samples as the ring can hold.
+     *
+     * This is the counted form of write() used by sink diagnostics. It has the
+     * same bounded behavior and does not change the queued audio policy.
+     *
+     * @param mono Mono signed 16-bit samples at 48 kHz.
+     * @return Number of input samples copied into the ring.
+     */
+    std::size_t write_count(std::span<const std::int16_t> mono) noexcept {
       if (mono.empty()) {
-        return true;
+        return 0;
       }
       if (!samples_) {
-        return false;
+        return 0;
       }
 
       const auto readIndex = readIndex_.load(std::memory_order_acquire);
@@ -81,7 +95,7 @@ namespace platf::remote_microphone::detail {
         samples_[slot + 1] = sample;
       }
       writeIndex_.store(writeIndex + framesToWrite, std::memory_order_release);
-      return framesToWrite == mono.size();
+      return static_cast<std::size_t>(framesToWrite);
     }
 
     /**
