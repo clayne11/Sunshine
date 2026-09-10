@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -68,6 +69,29 @@ namespace remote_microphone {
 
   namespace detail {
     using pcm_frame_t = std::array<std::int16_t, FRAME_SAMPLES>;  ///< One decoded microphone frame.
+    using jitter_packet_queue_t = std::map<std::int64_t, std::vector<std::uint8_t>>;  ///< Ordered decrypted Opus-payload playout queue.
+
+    /**
+     * @brief Result of enforcing the jitter queue's capacity.
+     */
+    struct jitter_trim_result_t {
+      bool overflow {};  ///< Whether at least one packet exceeded the queue capacity.
+      std::uint64_t skipped_frames {};  ///< Playout positions skipped while rebasing to retained audio.
+    };
+
+    /**
+     * @brief Enforce a bounded jitter queue after packet insertion.
+     *
+     * @param packets Ordered admitted packets.
+     * @param max_packets Maximum retained packet count.
+     * @param next_playout_sequence Sequence expected by the playout clock, when initialized.
+     * @return Capacity and playout-rebase details.
+     */
+    jitter_trim_result_t trim_jitter_queue(
+      jitter_packet_queue_t &packets,
+      std::size_t max_packets,
+      std::optional<std::int64_t> &next_playout_sequence
+    );
 
     /**
      * @brief State of the quarantined Core Audio sink initializer.

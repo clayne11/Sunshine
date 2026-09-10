@@ -50,7 +50,12 @@ at commit `5ec6288caacf07f679123fbd4b2f8ea46ba6724a`: UDP on the server base por
 plus 12 (48001 with the default base), 20 ms mono Opus frames, and the negotiated
 microphone encryption feature bit. The receiver requires a paired launch,
 negotiated encryption, and packets from the streaming client's IP address.
-It bounds packet reordering, concealment, and the device queue.
+It bounds packet reordering, concealment, and the device queue. The microphone
+jitter queue keeps at most four 20 ms packets. When a burst exceeds that limit,
+it drops the oldest queued audio and advances playout to the retained window,
+rather than preserving old gaps while repeatedly discarding fresh speech.
+Skipping audio resets decoder concealment state; it does not expand the queue
+or play a catch-up burst into the audio device.
 
 This extension uses AES-CBC without an authentication tag. Its encryption must
 not be described as authenticated encryption. Ordinary Moonlight clients do not

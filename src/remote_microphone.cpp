@@ -448,6 +448,23 @@ namespace remote_microphone {
     return result;
   }
 
+  detail::jitter_trim_result_t detail::trim_jitter_queue(
+    jitter_packet_queue_t &packets,
+    std::size_t max_packets,
+    std::optional<std::int64_t> &next_playout_sequence
+  ) {
+    jitter_trim_result_t result;
+    while (packets.size() > max_packets) {
+      result.overflow = true;
+      packets.erase(packets.begin());
+    }
+    if (result.overflow && next_playout_sequence && !packets.empty() && *next_playout_sequence < packets.begin()->first) {
+      result.skipped_frames = static_cast<std::uint64_t>(packets.begin()->first - *next_playout_sequence);
+      next_playout_sequence = packets.begin()->first;
+    }
+    return result;
+  }
+
   std::optional<packet_t> decrypt_packet(std::span<const std::uint8_t> datagram, crypto::cipher::cbc_t &cipher, std::uint32_t key_id) {
     if (datagram.size() <= header_size || datagram.size() > max_datagram_size || datagram[0] != 0 || datagram[1] != packet_type_opus) {
       return std::nullopt;
@@ -493,7 +510,7 @@ namespace remote_microphone {
     std::shared_ptr<detail::sink_mailbox_t> sink_mailbox;  ///< Quarantined sink delivery mailbox.
     std::jthread worker;  ///< Cooperative receiver and playout thread.
     sequence_window_t sequence_window;  ///< Replay and sequence-wrap admission state.
-    std::map<std::int64_t, std::vector<std::uint8_t>> packets;  ///< Bounded ordered jitter queue.
+    detail::jitter_packet_queue_t packets;  ///< Bounded ordered jitter queue.
     std::optional<std::int64_t> next_playout_sequence;  ///< Sequence expected at the next playout tick.
     std::optional<std::chrono::steady_clock::time_point> next_playout_time;  ///< Absolute next playout deadline.
     std::size_t consecutive_plc_frames {};  ///< Consecutive Opus loss-concealment frames generated.
@@ -586,9 +603,14 @@ namespace remote_microphone {
           }
           diagnostics.record_accepted(packet->opus_payload, packet->timestamp_ms, sequence->extended_sequence, std::chrono::steady_clock::now());
           packets.emplace(sequence->extended_sequence, std::move(packet->opus_payload));
-          if (packets.size() > max_buffered_packets) {
+          const auto trim_result = detail::trim_jitter_queue(packets, max_buffered_packets, next_playout_sequence);
+          if (trim_result.overflow) {
             diagnostics.record_jitter_overflow();
-            packets.erase(std::prev(packets.end()));
+          }
+          if (trim_result.skipped_frames != 0) {
+            diagnostics.record_skipped(trim_result.skipped_frames);
+            consecutive_plc_frames = 0;
+            (void) opus_decoder_ctl(decoder.get(), OPUS_RESET_STATE);
           }
           if (!next_playout_sequence) {
             next_playout_sequence = sequence->extended_sequence;
