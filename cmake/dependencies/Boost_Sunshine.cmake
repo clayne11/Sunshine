@@ -87,6 +87,22 @@ if(NOT Boost_FOUND)
     FetchContent_MakeAvailable(Boost)
     set(FETCH_CONTENT_BOOST_USED TRUE)
 
+    # Boost's FetchContent path creates Boost::headers but only creates the
+    # legacy Boost::boost compatibility target when
+    # BOOST_ENABLE_COMPATIBILITY_TARGETS is enabled. Simple-Web-Server still
+    # links Boost::boost, so provide that compatibility target without
+    # enabling Boost's unrelated compatibility targets globally.
+    if(NOT TARGET Boost::boost)
+        if(TARGET boost_headers)
+            add_library(Boost::boost ALIAS boost_headers)
+        elseif(TARGET Boost::headers)
+            add_library(Boost::boost INTERFACE IMPORTED)
+            set_property(TARGET Boost::boost PROPERTY INTERFACE_LINK_LIBRARIES Boost::headers)
+        else()
+            message(FATAL_ERROR "Boost FetchContent did not provide Boost::headers or boost_headers")
+        endif()
+    endif()
+
     set(Boost_FOUND TRUE)  # cmake-lint: disable=C0103
     set(Boost_INCLUDE_DIRS  # cmake-lint: disable=C0103
             "$<BUILD_INTERFACE:${Boost_SOURCE_DIR}/libs/headers/include>")
