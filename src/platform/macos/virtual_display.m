@@ -308,24 +308,51 @@ uint32_t virtual_display_create_with_request(const virtual_display_request_t *re
 
   NSLog(@"[Sunshine] vd_helper spawned (pid=%d)", pid);
 
-  // Read displayID from child's stdout (with timeout)
-  char buf[64] = {0};
-  ssize_t n = 0;
-  fd_set readfds;
-  struct timeval tv;
-  tv.tv_sec = 10;
-  tv.tv_usec = 0;
-  FD_ZERO(&readfds);
-  FD_SET(pipefd[0], &readfds);
+  // Read the guardian's display-ID line within one monotonic startup deadline.
+  vd_display_id_line_t line = {};
+  vd_display_id_line_result_t lineResult = VD_DISPLAY_ID_LINE_MORE;
+  uint32_t displayID = 0;
+  const uint64_t startedAt = vd_monotonic_milliseconds();
+  const uint64_t deadline = startedAt + VD_CONTROLLER_STARTUP_TIMEOUT_MS;
+  while (startedAt != 0 && lineResult == VD_DISPLAY_ID_LINE_MORE) {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(pipefd[0], &readfds);
+    struct timeval timeout = {};
+    if (!vd_startup_wait_interval(vd_monotonic_milliseconds(), deadline, 0, &timeout)) {
+      break;
+    }
 
-  int sel = select(pipefd[0] + 1, &readfds, NULL, NULL, &tv);
-  if (sel > 0) {
-    n = read(pipefd[0], buf, sizeof(buf) - 1);
+    const int selected = select(pipefd[0] + 1, &readfds, NULL, NULL, &timeout);
+    if (selected < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      lineResult = VD_DISPLAY_ID_LINE_ERROR;
+      break;
+    }
+    if (selected == 0) {
+      break;
+    }
+
+    char bytes[64];
+    const ssize_t bytesRead = read(pipefd[0], bytes, sizeof(bytes));
+    if (bytesRead < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      lineResult = VD_DISPLAY_ID_LINE_ERROR;
+      break;
+    }
+    if (bytesRead == 0) {
+      break;
+    }
+    lineResult = vd_display_id_line_append(&line, bytes, (size_t) bytesRead, &displayID);
   }
   close(pipefd[0]);
 
-  if (n <= 0) {
-    NSLog(@"[Sunshine] vd_helper produced no output, killing");
+  if (lineResult != VD_DISPLAY_ID_LINE_READY) {
+    NSLog(@"[Sunshine] vd_helper did not report a valid display ID within the startup deadline, killing");
     if (!stopHelper(pid)) {
       NSLog(@"[Sunshine] Could not reap vd_helper pid=%d after failed startup", pid);
       retainUnreapedHelper(pid, 0);
@@ -336,12 +363,7 @@ uint32_t virtual_display_create_with_request(const virtual_display_request_t *re
     return 0;
   }
 
-  char *end = NULL;
-  errno = 0;
-  const unsigned long parsedID = strtoul(buf, &end, 10);
-  const bool validID = errno == 0 && end != buf && parsedID <= UINT32_MAX && (*end == '\0' || *end == '\n');
-  const uint32_t displayID = validID ? (uint32_t) parsedID : 0;
-  if (!validID || displayID == 0) {
+  if (displayID == 0) {
     NSLog(@"[Sunshine] vd_helper returned displayID=0, killing");
     if (!stopHelper(pid)) {
       NSLog(@"[Sunshine] Could not reap vd_helper pid=%d after invalid display ID", pid);

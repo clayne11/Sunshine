@@ -9,8 +9,101 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+/** @brief Sunshine-to-guardian startup deadline in milliseconds. */
+#define VD_CONTROLLER_STARTUP_TIMEOUT_MS 20000ULL
+/** @brief Guardian-to-holder startup deadline in milliseconds. */
+#define VD_GUARDIAN_STARTUP_TIMEOUT_MS 18000ULL
+/** @brief Maximum guardian polling interval while supervising its parent and holder. */
+#define VD_GUARDIAN_STARTUP_SLICE_MS 100ULL
+
+/** @brief Incremental state for the helper's one-line display-ID protocol. */
+typedef struct vd_display_id_line_t {
+  char buffer[64];  ///< Bounded decimal display ID and newline.
+  size_t used;  ///< Bytes accumulated in buffer.
+} vd_display_id_line_t;
+
+/** @brief Result of adding bytes to a display-ID protocol line. */
+typedef enum vd_display_id_line_result_t {
+  VD_DISPLAY_ID_LINE_MORE,  ///< A complete newline-terminated line has not arrived.
+  VD_DISPLAY_ID_LINE_READY,  ///< A valid display ID line was parsed.
+  VD_DISPLAY_ID_LINE_ERROR,  ///< The line was malformed or exceeded its bound.
+} vd_display_id_line_result_t;
+
+/**
+ * @brief Return a monotonic timestamp in milliseconds.
+ * @return Milliseconds since an arbitrary monotonic epoch, or zero on failure.
+ */
+static inline uint64_t vd_monotonic_milliseconds(void) {
+  struct timespec now = {};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+    return 0;
+  }
+  return (uint64_t) now.tv_sec * 1000ULL + (uint64_t) now.tv_nsec / 1000000ULL;
+}
+
+/**
+ * @brief Bound one wait interval by an absolute startup deadline.
+ * @param now_ms Current monotonic time in milliseconds.
+ * @param deadline_ms Absolute monotonic deadline in milliseconds.
+ * @param maximum_ms Maximum desired wait interval in milliseconds.
+ * @param timeout Receives a timeval suitable for select().
+ * @return True when time remains before the deadline.
+ */
+static inline bool vd_startup_wait_interval(uint64_t now_ms, uint64_t deadline_ms, uint64_t maximum_ms, struct timeval *timeout) {
+  if (!timeout || now_ms == 0 || now_ms >= deadline_ms) {
+    return false;
+  }
+  uint64_t remaining_ms = deadline_ms - now_ms;
+  if (maximum_ms > 0 && remaining_ms > maximum_ms) {
+    remaining_ms = maximum_ms;
+  }
+  timeout->tv_sec = (time_t) (remaining_ms / 1000ULL);
+  timeout->tv_usec = (suseconds_t) ((remaining_ms % 1000ULL) * 1000ULL);
+  return true;
+}
+
+/**
+ * @brief Append bytes and parse one bounded newline-terminated display ID.
+ * @param line Mutable protocol buffer.
+ * @param bytes Newly read bytes.
+ * @param byte_count Number of newly read bytes.
+ * @param display_id Receives the parsed ID, including zero for helper failure.
+ * @return Whether more bytes are needed, the ID is ready, or the line is invalid.
+ */
+static inline vd_display_id_line_result_t vd_display_id_line_append(vd_display_id_line_t *line, const char *bytes, size_t byte_count, uint32_t *display_id) {
+  if (!line || !bytes || !display_id || byte_count == 0 || line->used >= sizeof(line->buffer) || byte_count > sizeof(line->buffer) - line->used - 1) {
+    return VD_DISPLAY_ID_LINE_ERROR;
+  }
+
+  memcpy(line->buffer + line->used, bytes, byte_count);
+  line->used += byte_count;
+  line->buffer[line->used] = '\0';
+  char *newline = (char *) memchr(line->buffer, '\n', line->used);
+  if (!newline) {
+    return VD_DISPLAY_ID_LINE_MORE;
+  }
+  if (newline != line->buffer + line->used - 1) {
+    return VD_DISPLAY_ID_LINE_ERROR;
+  }
+
+  *newline = '\0';
+  char *end = NULL;
+  errno = 0;
+  const unsigned long parsed = strtoul(line->buffer, &end, 10);
+  if (errno != 0 || end == line->buffer || end != newline || parsed > UINT32_MAX) {
+    return VD_DISPLAY_ID_LINE_ERROR;
+  }
+  *display_id = (uint32_t) parsed;
+  return VD_DISPLAY_ID_LINE_READY;
+}
 
 /**
  * @brief Move a descriptor above stdin, stdout, and stderr when necessary.

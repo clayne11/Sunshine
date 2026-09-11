@@ -226,6 +226,57 @@ static BOOL installSignalHandlers(void) {
          sigaction(SIGHUP, &action, NULL) == 0;
 }
 
+/** @brief Callback state for one holder-owned virtual display. */
+typedef struct display_reconfiguration_context_t {
+  CGDirectDisplayID display_id;  ///< Virtual display whose configuration is tracked.
+  atomic_bool mode_change_pending;  ///< Whether CoreGraphics delivered a completed reconfiguration.
+} display_reconfiguration_context_t;
+
+/**
+ * @brief Notice completed CoreGraphics reconfiguration events for the held display.
+ * @param display Display associated with the callback.
+ * @param flags Summary of the display configuration changes.
+ * @param userInfo Pointer to the holder's reconfiguration context.
+ */
+static void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
+  display_reconfiguration_context_t *context = userInfo;
+  if (!context || display != context->display_id || (flags & kCGDisplayBeginConfigurationFlag) != 0) {
+    return;
+  }
+  atomic_store_explicit(&context->mode_change_pending, true, memory_order_release);
+}
+
+/**
+ * @brief Process display events for a bounded interval on the current process's main thread.
+ *
+ * The holder uses AppKit's event queue so CoreGraphics refreshes process-local
+ * display state. The guardian does not initialize NSApplication and therefore
+ * retains the Core Foundation run-loop behavior used for recovery.
+ *
+ * @param interval Maximum number of seconds to process events.
+ */
+static void pumpApplicationEvents(NSTimeInterval interval) {
+  @autoreleasepool {
+    const NSTimeInterval boundedInterval = MAX(interval, 0.0);
+    if (!NSApp) {
+      CFRunLoopRunInMode(kCFRunLoopDefaultMode, boundedInterval, false);
+      return;
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:boundedInterval];
+    while ([deadline timeIntervalSinceNow] > 0.0) {
+      NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                          untilDate:deadline
+                                             inMode:NSDefaultRunLoopMode
+                                            dequeue:YES];
+      if (!event) {
+        break;
+      }
+      [NSApp sendEvent:event];
+    }
+  }
+}
+
 /**
  * @brief Check whether a display ID is in the active display list.
  * @param targetID Display identifier to find.
@@ -303,7 +354,7 @@ static void wakeDisplayBeforeSnapshot(void) {
   static const unsigned int attempts = 10;
   static const CFTimeInterval interval = 0.05;
   for (unsigned int attempt = 0; attempt < attempts && !ordinaryDisplayIsActive(); ++attempt) {
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, interval, false);
+    pumpApplicationEvents(interval);
   }
 
   const IOReturn releaseResult = IOPMAssertionRelease(activityAssertionID);
@@ -327,7 +378,7 @@ static BOOL waitForDisplayReady(CGDirectDisplayID displayID) {
     if (CGDisplayIsOnline(displayID) && CGDisplayIsActive(displayID)) {
       return YES;
     }
-    usleep(interval);
+    pumpApplicationEvents((NSTimeInterval) interval / 1000000.0);
   }
   return !shouldExit && parentIsAlive() && CGDisplayIsOnline(displayID) && CGDisplayIsActive(displayID);
 }
@@ -454,7 +505,7 @@ static BOOL waitForOriginalDisplays(CGDirectDisplayID virtualID) {
   for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
     // CoreGraphics display notifications update process-local state through
     // the run loop. Pump it before inspecting the post-transaction layout.
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, interval, false);
+    pumpApplicationEvents(interval);
     if (originalDisplaysAreActive(virtualID)) {
       return YES;
     }
@@ -474,7 +525,7 @@ static BOOL restoreOriginalDisplays(CGDirectDisplayID virtualID, CGConfigureOpti
   // case, while retaining the transaction for every physical baseline so a
   // stale CoreGraphics active-list cache cannot hide a missing display.
   if (originalDisplayCount == 0 && originalOnlineDisplayCount == 0) {
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    pumpApplicationEvents(0.05);
     if (originalDisplaysAreActive(virtualID)) {
       fprintf(stderr, "[vd_helper] No ordinary display state requires restoration; skipping empty transaction\n");
       return YES;
@@ -540,7 +591,7 @@ static BOOL recoverOriginalDisplays(CGDirectDisplayID virtualID) {
   static const unsigned int attempts = 3;
   static const CFTimeInterval settleInterval = 0.05;
 
-  CFRunLoopRunInMode(kCFRunLoopDefaultMode, settleInterval, false);
+  pumpApplicationEvents(settleInterval);
   if (originalDisplaysAreActive(virtualID)) {
     return YES;
   }
@@ -549,7 +600,7 @@ static BOOL recoverOriginalDisplays(CGDirectDisplayID virtualID) {
     if (restoreOriginalDisplays(virtualID, kCGConfigureForSession)) {
       return YES;
     }
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
+    pumpApplicationEvents(0.25);
   }
   return NO;
 }
@@ -568,7 +619,7 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   // A previous cleanup or WindowServer transition may already have left the
   // requested strict virtual-only state.  Do not reopen a configuration just
   // to disable physical displays that are already inactive.
-  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+  pumpApplicationEvents(0.05);
   if (onlyVirtualDisplayActive(virtualID)) {
     fprintf(stderr, "[vd_helper] Exclusive display state is already active; skipping configuration transaction\n");
     exclusiveApplied = YES;
@@ -597,6 +648,9 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   }
 
   error = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
+  if (error == kCGErrorSuccess) {
+    pumpApplicationEvents(0.25);
+  }
   if (error != kCGErrorSuccess || !waitForDisplayReady(virtualID) || !onlyVirtualDisplayActive(virtualID)) {
     fprintf(stderr, "[vd_helper] Exclusive configuration did not leave only virtual display active\n");
     if (!restoreOriginalDisplays(virtualID, kCGConfigureForAppOnly)) {
@@ -633,11 +687,14 @@ static BOOL activateVirtualDisplay(CGDirectDisplayID virtualID, BOOL exclusive) 
   }
 
   const CGConfigureOption option = exclusive ? kCGConfigureForAppOnly : kCGConfigureForSession;
+  const CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+  fprintf(stderr, "[vd_helper] Completing virtual display activation\n");
   error = CGCompleteDisplayConfiguration(config, option);
   if (error != kCGErrorSuccess) {
-    fprintf(stderr, "[vd_helper] Could not activate virtual display %u: %d\n", virtualID, error);
+    fprintf(stderr, "[vd_helper] Could not activate virtual display %u after %.3fs: %d\n", virtualID, CFAbsoluteTimeGetCurrent() - start, error);
     return NO;
   }
+  fprintf(stderr, "[vd_helper] Completed virtual display activation in %.3fs\n", CFAbsoluteTimeGetCurrent() - start);
   return YES;
 }
 
@@ -889,51 +946,6 @@ static BOOL readCurrentDisplayMode(CGDirectDisplayID displayID, macos_display_mo
   return validModeSnapshot(mode);
 }
 
-/** @brief Callback state for one holder-owned virtual display. */
-typedef struct display_reconfiguration_context_t {
-  CGDirectDisplayID display_id;  ///< Virtual display whose configuration is tracked.
-  atomic_bool mode_change_pending;  ///< Whether CoreGraphics delivered a completed reconfiguration.
-} display_reconfiguration_context_t;
-
-/**
- * @brief Notice completed CoreGraphics reconfiguration events for the held display.
- * @param display Display associated with the callback.
- * @param flags Summary of the display configuration changes.
- * @param userInfo Pointer to the holder's reconfiguration context.
- */
-static void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
-  display_reconfiguration_context_t *context = userInfo;
-  if (!context || display != context->display_id || (flags & kCGDisplayBeginConfigurationFlag) != 0) {
-    return;
-  }
-  atomic_store_explicit(&context->mode_change_pending, true, memory_order_release);
-}
-
-/**
- * @brief Process AppKit events for a bounded interval on the holder's main thread.
- *
- * CoreGraphics delivers display reconfiguration callbacks to applications that
- * are listening for events on their event-processing thread. Running the bare
- * Core Foundation run loop does not dispatch the AppKit event queue.
- *
- * @param interval Maximum number of seconds to process events.
- */
-static void pumpApplicationEvents(NSTimeInterval interval) {
-  @autoreleasepool {
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:MAX(interval, 0.0)];
-    while (!shouldExit && [deadline timeIntervalSinceNow] > 0.0) {
-      NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                          untilDate:deadline
-                                             inMode:NSDefaultRunLoopMode
-                                            dequeue:YES];
-      if (!event) {
-        break;
-      }
-      [NSApp sendEvent:event];
-    }
-  }
-}
-
 /**
  * @brief Add one unique virtual-display mode to a settings list.
  * @param modes Mutable settings mode list.
@@ -1175,7 +1187,6 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     // Initialize NSApplication
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-    [NSApp finishLaunching];
 
     // Create display directly on main thread
     CGVirtualDisplayDescriptor *desc = [[CGVirtualDisplayDescriptor alloc] init];
@@ -1272,12 +1283,25 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     keepDesc = desc;
     uint32_t resultID = display.displayID;
 
+    // Register before activation so pumping AppKit events also refreshes
+    // process-local CoreGraphics state for startup display transactions.
+    display_reconfiguration_context_t reconfigurationContext = {resultID};
+    atomic_init(&reconfigurationContext.mode_change_pending, false);
+    const CGError callbackError = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
+    const BOOL callbackRegistered = callbackError == kCGErrorSuccess;
+    if (!callbackRegistered) {
+      fprintf(stderr, "[vd_helper] Could not register display reconfiguration callback: %d; falling back to polling\n", callbackError);
+    }
+
     fprintf(stderr, "[vd_helper] Display %u created, activating...\n", resultID);
 
     if (!parentIsAlive() || shouldExit || !activateVirtualDisplay(resultID, request.exclusive)) {
       fprintf(stderr, "[vd_helper] Virtual display activation failed\n");
       if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
+      }
+      if (callbackRegistered) {
+        (void) CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -1287,12 +1311,15 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     }
 
     // Wait for WindowServer to process the display
-    usleep(500000);  // 500ms
+    pumpApplicationEvents(0.5);
 
     if (!parentIsAlive() || shouldExit) {
       fprintf(stderr, "[vd_helper] Parent exited while activating virtual display\n");
       if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
+      }
+      if (callbackRegistered) {
+        (void) CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -1313,18 +1340,18 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     (void) selectRequestedDisplayMode(resultID, &request);
 
     // Wait for mode switch to take effect
-    usleep(500000);  // 500ms
+    pumpApplicationEvents(0.5);
 
     // Step 3: If still not visible, try again after a longer wait
     uint32_t count = 0;
     BOOL found = checkDisplayInList(resultID, &count);
     if (!found) {
       fprintf(stderr, "[vd_helper] Display %u not found after first attempt, retrying...\n", resultID);
-      sleep(1);
+      pumpApplicationEvents(1.0);
       // Check mirror state again
       fprintf(stderr, "[vd_helper] Mirror state (retry): inMirrorSet=%d, mirrorsDisplay=%u\n", CGDisplayIsInMirrorSet(resultID), CGDisplayMirrorsDisplay(resultID));
       forceExtendMode(resultID);
-      usleep(500000);
+      pumpApplicationEvents(0.5);
       found = checkDisplayInList(resultID, &count);
     }
 
@@ -1334,6 +1361,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper] Display %u did not become online and active\n", resultID);
       if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
+      }
+      if (callbackRegistered) {
+        (void) CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -1345,6 +1375,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     if (request.exclusive && !applyExclusiveMode(resultID)) {
       fprintf(stderr, "[vd_helper] Could not enter exclusive display mode\n");
       restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
+      if (callbackRegistered) {
+        (void) CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
+      }
       keepAlive = nil;
       keepDesc = nil;
       fprintf(stdout, "0\n");
@@ -1356,6 +1389,9 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper] Parent exited before virtual display became ready\n");
       if (request.exclusive) {
         restoreOriginalDisplays(resultID, kCGConfigureForAppOnly);
+      }
+      if (callbackRegistered) {
+        (void) CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
       }
       keepAlive = nil;
       keepDesc = nil;
@@ -1376,20 +1412,12 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper]   ours[%u]: online=%d, active=%d, inMirror=%d, mirrors=%u\n", resultID, CGDisplayIsOnline(resultID), CGDisplayIsActive(resultID), CGDisplayIsInMirrorSet(resultID), CGDisplayMirrorsDisplay(resultID));
     }
 
-    // Register before the first snapshot. CoreGraphics guarantees its display
-    // state is current when it delivers a completed reconfiguration callback.
-    display_reconfiguration_context_t reconfigurationContext = {resultID};
-    atomic_init(&reconfigurationContext.mode_change_pending, false);
-    const CGError callbackError = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
-    const BOOL callbackRegistered = callbackError == kCGErrorSuccess;
-    if (!callbackRegistered) {
-      fprintf(stderr, "[vd_helper] Could not register display reconfiguration callback: %d; falling back to polling\n", callbackError);
-    }
-
     // Let activation and exclusive-mode notifications settle. WindowServer can
     // restore a mode remembered for this serial after the earlier selection, so
     // enforce the requested effective mode once more before fixing the baseline.
-    pumpApplicationEvents(0.25);
+    if (!request.exclusive) {
+      pumpApplicationEvents(0.25);
+    }
     macos_display_mode_t settledMode = {};
     if (readCurrentDisplayMode(resultID, &settledMode) && !vd_helper_effective_mode_matches(&settledMode, &request.effective)) {
       fprintf(stderr, "[vd_helper] Reapplying requested mode after WindowServer restored %ux%u logical (%ux%u pixels, %.3fHz)\n", settledMode.logical_width, settledMode.logical_height, settledMode.pixel_width, settledMode.pixel_height, settledMode.refresh_rate);
@@ -1447,15 +1475,14 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       }
     }
 
+    if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
+      fprintf(stderr, "[vd_helper] Display restoration during shutdown failed\n");
+    }
     if (callbackRegistered) {
       const CGError removalError = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
       if (removalError != kCGErrorSuccess) {
         fprintf(stderr, "[vd_helper] Could not remove display reconfiguration callback: %d\n", removalError);
       }
-    }
-
-    if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
-      fprintf(stderr, "[vd_helper] Display restoration during shutdown failed\n");
     }
     fprintf(stderr, "[vd_helper] Shutting down, releasing display %u\n", resultID);
     keepAlive = nil;
@@ -1481,12 +1508,14 @@ typedef enum {
  * @return Startup protocol result.
  */
 static vd_holder_start_result_t readHolderDisplayID(int descriptor, pid_t holderPID, uint32_t *displayID, int *holderStatus) {
-  static const unsigned int attempts = 90;
-  static const suseconds_t interval = 100000;
-  char buffer[64] = {0};
-  size_t used = 0;
+  vd_display_id_line_t line = {};
+  const uint64_t startedAt = vd_monotonic_milliseconds();
+  if (startedAt == 0) {
+    return VD_HOLDER_START_ERROR;
+  }
+  const uint64_t deadline = startedAt + VD_GUARDIAN_STARTUP_TIMEOUT_MS;
 
-  for (unsigned int attempt = 0; attempt < attempts; ++attempt) {
+  while (true) {
     if (shouldExit || !parentIsAlive()) {
       return VD_HOLDER_START_ABORTED;
     }
@@ -1494,10 +1523,14 @@ static vd_holder_start_result_t readHolderDisplayID(int descriptor, pid_t holder
     fd_set readSet;
     FD_ZERO(&readSet);
     FD_SET(descriptor, &readSet);
-    struct timeval timeout = {0, interval};
+    struct timeval timeout = {};
+    if (!vd_startup_wait_interval(vd_monotonic_milliseconds(), deadline, VD_GUARDIAN_STARTUP_SLICE_MS, &timeout)) {
+      return VD_HOLDER_START_ERROR;
+    }
     const int selected = select(descriptor + 1, &readSet, NULL, NULL, &timeout);
     if (selected > 0) {
-      const ssize_t bytesRead = read(descriptor, buffer + used, sizeof(buffer) - used - 1);
+      char bytes[64];
+      const ssize_t bytesRead = read(descriptor, bytes, sizeof(bytes));
       if (bytesRead < 0) {
         if (errno == EINTR) {
           continue;
@@ -1508,22 +1541,11 @@ static vd_holder_start_result_t readHolderDisplayID(int descriptor, pid_t holder
         const int state = vd_reap_child_if_exited(holderPID, holderStatus);
         return state == 1 ? VD_HOLDER_START_EXITED : VD_HOLDER_START_ERROR;
       }
-      used += (size_t) bytesRead;
-      buffer[used] = '\0';
-
-      char *newline = memchr(buffer, '\n', used);
-      if (newline) {
-        *newline = '\0';
-        char *end = NULL;
-        errno = 0;
-        const unsigned long parsed = strtoul(buffer, &end, 10);
-        if (errno != 0 || end == buffer || end != newline || parsed > UINT32_MAX) {
-          return VD_HOLDER_START_ERROR;
-        }
-        *displayID = (uint32_t) parsed;
+      const vd_display_id_line_result_t lineResult = vd_display_id_line_append(&line, bytes, (size_t) bytesRead, displayID);
+      if (lineResult == VD_DISPLAY_ID_LINE_READY) {
         return VD_HOLDER_START_READY;
       }
-      if (used == sizeof(buffer) - 1) {
+      if (lineResult == VD_DISPLAY_ID_LINE_ERROR) {
         return VD_HOLDER_START_ERROR;
       }
     } else if (selected < 0 && errno != EINTR) {
@@ -1538,7 +1560,6 @@ static vd_holder_start_result_t readHolderDisplayID(int descriptor, pid_t holder
       return VD_HOLDER_START_ERROR;
     }
   }
-  return VD_HOLDER_START_ERROR;
 }
 
 /**

@@ -43,9 +43,12 @@ Retained capabilities:
   enablement targets physical displays only. Normal shutdown restores them
   before releasing the virtual display; a surviving supervisor also restores
   them after a holder crash. App-only scope does not provide automatic crash
-  restoration. Helper spawning
-  closes unrelated file descriptors so it cannot retain the server's listening
-  sockets.
+  restoration. Process AppKit display events during activation, exclusivity
+  validation, and restoration so those checks see current WindowServer state.
+  Startup readiness uses monotonic deadlines of 18 seconds for the holder and
+  20 seconds for the controller; cleanup still runs after a failed startup.
+  Helper spawning closes unrelated file descriptors so it cannot retain the
+  server's listening sockets.
 - Exclude the observed macOS fallback and stale Sunshine virtual-display
   signatures from saved physical-display snapshots. WindowServer may replace
   those IDs during headless startup, making them invalid hardware enablement

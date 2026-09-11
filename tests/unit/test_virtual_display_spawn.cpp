@@ -2,7 +2,7 @@
  * @file tests/unit/test_virtual_display_spawn.cpp
  * @brief Verify the descriptor policy used when spawning vd_helper.
  */
-#include "../tests_common.h"
+#include <gtest/gtest.h>
 
 #if defined(__APPLE__)
 
@@ -19,6 +19,42 @@
   #include <unistd.h>
 
 extern char **environ;
+
+TEST(VirtualDisplaySpawn, BoundsWaitIntervalsByMonotonicDeadline) {
+  struct timeval timeout = {};
+  EXPECT_TRUE(vd_startup_wait_interval(1000, 21000, 0, &timeout));
+  EXPECT_EQ(timeout.tv_sec, 20);
+  EXPECT_EQ(timeout.tv_usec, 0);
+
+  EXPECT_TRUE(vd_startup_wait_interval(20550, 21000, VD_GUARDIAN_STARTUP_SLICE_MS, &timeout));
+  EXPECT_EQ(timeout.tv_sec, 0);
+  EXPECT_EQ(timeout.tv_usec, 100000);
+  EXPECT_FALSE(vd_startup_wait_interval(0, 21000, 0, &timeout));
+  EXPECT_FALSE(vd_startup_wait_interval(21000, 21000, 0, &timeout));
+}
+
+TEST(VirtualDisplaySpawn, ParsesPartialDisplayIdLine) {
+  vd_display_id_line_t line = {};
+  uint32_t display_id = 0;
+  EXPECT_EQ(vd_display_id_line_append(&line, "53", 2, &display_id), VD_DISPLAY_ID_LINE_MORE);
+  EXPECT_EQ(vd_display_id_line_append(&line, "4\n", 2, &display_id), VD_DISPLAY_ID_LINE_READY);
+  EXPECT_EQ(display_id, 534U);
+}
+
+TEST(VirtualDisplaySpawn, RejectsMalformedOrOversizedDisplayIdLine) {
+  vd_display_id_line_t trailing = {};
+  vd_display_id_line_t overflow = {};
+  vd_display_id_line_t oversized = {};
+  uint32_t display_id = 0;
+  EXPECT_EQ(vd_display_id_line_append(&trailing, "5\n6", 3, &display_id), VD_DISPLAY_ID_LINE_ERROR);
+  EXPECT_EQ(vd_display_id_line_append(&overflow, "4294967296\n", 11, &display_id), VD_DISPLAY_ID_LINE_ERROR);
+
+  const std::string full(63, '1');
+  EXPECT_EQ(vd_display_id_line_append(&oversized, full.data(), full.size(), &display_id), VD_DISPLAY_ID_LINE_MORE);
+  EXPECT_EQ(vd_display_id_line_append(&oversized, "\n", 1, &display_id), VD_DISPLAY_ID_LINE_ERROR);
+  oversized.used = sizeof(oversized.buffer);
+  EXPECT_EQ(vd_display_id_line_append(&oversized, "1", 1, &display_id), VD_DISPLAY_ID_LINE_ERROR);
+}
 
 TEST(VirtualDisplaySpawn, ClosesUnlistedPipeAndSocketDescriptors) {
   int inherited_pipe[2];
