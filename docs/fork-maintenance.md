@@ -27,8 +27,16 @@ Retained capabilities:
 - Target input at the current captured display, including its current logical
   bounds, instead of caching the physical display's scale or dimensions.
 - Persist a virtual-display mode changed in macOS Displays under the paired
-  client's certificate fingerprint and exact requested width, height, and frame
-  rate. A matching reconnect restores both logical and backing-pixel dimensions.
+  client's certificate fingerprint and requested width and height. Each client
+  resolution has an independent mapping. A matching reconnect restores logical
+  and backing-pixel dimensions while using the connection's current refresh rate.
+  Legacy single-entry files remain readable for their matching client resolution.
+  The virtual monitor serial uses the same client-resolution identity. Process
+  AppKit events to keep mode snapshots current, and reapply the requested mode
+  after WindowServer restores any remembered monitor state during startup. Observe
+  full mode changes while the display is live and save each dimension or HiDPI
+  change, including a return to the initial mode; refresh-only changes do not
+  create a resolution preference. A final snapshot preserves any pending save.
   Requests from another paired client or for another tuple never inherit the
   live display; they retry after its current session has finished.
 - Keep the `CGVirtualDisplay` lifecycle in a dedicated helper. Private hardware

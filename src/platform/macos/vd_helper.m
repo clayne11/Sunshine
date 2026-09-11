@@ -15,6 +15,7 @@
  * Compiled with ARC (-fobjc-arc).
  */
 #include "display_preferences.h"
+#include "vd_helper_mode_policy.h"
 #include "vd_helper_policy.h"
 #include "vd_spawn.h"
 
@@ -24,6 +25,7 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -887,16 +889,49 @@ static BOOL readCurrentDisplayMode(CGDirectDisplayID displayID, macos_display_mo
   return validModeSnapshot(mode);
 }
 
+/** @brief Callback state for one holder-owned virtual display. */
+typedef struct display_reconfiguration_context_t {
+  CGDirectDisplayID display_id;  ///< Virtual display whose configuration is tracked.
+  atomic_bool mode_change_pending;  ///< Whether CoreGraphics delivered a completed reconfiguration.
+} display_reconfiguration_context_t;
+
 /**
- * @brief Compare two mode snapshots with a small refresh-rate tolerance.
- * @param lhs First mode.
- * @param rhs Second mode.
- * @return YES when dimensions, scale, and refresh rate match.
+ * @brief Notice completed CoreGraphics reconfiguration events for the held display.
+ * @param display Display associated with the callback.
+ * @param flags Summary of the display configuration changes.
+ * @param userInfo Pointer to the holder's reconfiguration context.
  */
-static BOOL sameDisplayMode(const macos_display_mode_t *lhs, const macos_display_mode_t *rhs) {
-  return lhs && rhs && lhs->logical_width == rhs->logical_width && lhs->logical_height == rhs->logical_height &&
-         lhs->pixel_width == rhs->pixel_width && lhs->pixel_height == rhs->pixel_height && lhs->hidpi == rhs->hidpi &&
-         fabs(lhs->refresh_rate - rhs->refresh_rate) <= 0.25;
+static void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
+  display_reconfiguration_context_t *context = userInfo;
+  if (!context || display != context->display_id || (flags & kCGDisplayBeginConfigurationFlag) != 0) {
+    return;
+  }
+  atomic_store_explicit(&context->mode_change_pending, true, memory_order_release);
+}
+
+/**
+ * @brief Process AppKit events for a bounded interval on the holder's main thread.
+ *
+ * CoreGraphics delivers display reconfiguration callbacks to applications that
+ * are listening for events on their event-processing thread. Running the bare
+ * Core Foundation run loop does not dispatch the AppKit event queue.
+ *
+ * @param interval Maximum number of seconds to process events.
+ */
+static void pumpApplicationEvents(NSTimeInterval interval) {
+  @autoreleasepool {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:MAX(interval, 0.0)];
+    while (!shouldExit && [deadline timeIntervalSinceNow] > 0.0) {
+      NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                          untilDate:deadline
+                                             inMode:NSDefaultRunLoopMode
+                                            dequeue:YES];
+      if (!event) {
+        break;
+      }
+      [NSApp sendEvent:event];
+    }
+  }
 }
 
 /**
@@ -1004,35 +1039,84 @@ static BOOL selectRequestedDisplayMode(CGDirectDisplayID displayID, const displa
 }
 
 /**
- * @brief Persist a changed mode while the holder still owns the virtual display.
- * @param displayID Virtual display identifier to inspect.
+ * @brief Persist a changed full-mode snapshot while the holder owns the display.
  * @param request Request and profile context for the current client.
- * @param baseline Mode observed after startup and selection.
- * @return YES when a changed mode was written, or when no write was needed.
+ * @param mode Validated mode to write for the request's resolution mapping.
+ * @return YES when the changed mode was written.
  */
-static BOOL persistChangedDisplayMode(
-  CGDirectDisplayID displayID,
+static BOOL saveChangedDisplayMode(
   const display_request_t *request,
-  const macos_display_mode_t *baseline
+  const macos_display_mode_t *mode
 ) {
-  if (!request || !baseline || !validModeSnapshot(baseline) || !request->profile_directory || !request->certificate_fingerprint || request->profile_directory[0] == '\0' || request->certificate_fingerprint[0] == '\0') {
-    return NO;
-  }
-
-  macos_display_mode_t current = {};
-  if (!readCurrentDisplayMode(displayID, &current) || sameDisplayMode(&current, baseline)) {
+  if (!request || !validModeSnapshot(mode) || !request->profile_directory || !request->certificate_fingerprint || request->profile_directory[0] == '\0' || request->certificate_fingerprint[0] == '\0') {
     return NO;
   }
 
   const macos_display_preference_t preference = {
     request->requested,
-    current
+    *mode
   };
   if (!macos_display_preferences_save(request->profile_directory, request->certificate_fingerprint, &preference)) {
     fprintf(stderr, "[vd_helper] Could not persist changed virtual-display mode\n");
     return NO;
   }
-  fprintf(stderr, "[vd_helper] Persisted changed virtual-display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", current.logical_width, current.logical_height, current.pixel_width, current.pixel_height, current.refresh_rate);
+  fprintf(stderr, "[vd_helper] Persisted changed virtual-display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", mode->logical_width, mode->logical_height, mode->pixel_width, mode->pixel_height, mode->refresh_rate);
+  return YES;
+}
+
+/**
+ * @brief Observe and persist a live full-mode snapshot when its dimensions changed.
+ * @param displayID Virtual display identifier to inspect.
+ * @param request Request and profile context for the current client.
+ * @param tracker Last observed and pending-to-save mode state.
+ * @param phase Human-readable observation phase for diagnostics.
+ * @param readFailureLogged Tracks whether a repeated read failure was already reported.
+ * @param changed Receives whether this observation changed dimensions or HiDPI state.
+ * @return YES when a complete current mode was observed.
+ */
+static BOOL observeAndPersistDisplayMode(
+  CGDirectDisplayID displayID,
+  const display_request_t *request,
+  vd_helper_mode_tracker_t *tracker,
+  const char *phase,
+  BOOL *readFailureLogged,
+  BOOL *changed
+) {
+  if (changed) {
+    *changed = NO;
+  }
+  if (!request || !tracker) {
+    return NO;
+  }
+
+  macos_display_mode_t current = {};
+  if (!readCurrentDisplayMode(displayID, &current)) {
+    if (!readFailureLogged || !*readFailureLogged) {
+      fprintf(stderr, "[vd_helper] Could not read a complete %s display mode; retaining the last valid observation\n", phase ? phase : "live");
+    }
+    if (readFailureLogged) {
+      *readFailureLogged = YES;
+    }
+    return NO;
+  }
+  if (readFailureLogged) {
+    *readFailureLogged = NO;
+  }
+
+  const BOOL hadObservation = tracker->has_last_observed;
+  const BOOL modeChanged = vd_helper_mode_tracker_observe(tracker, &current, true);
+  if (!hadObservation) {
+    fprintf(stderr, "[vd_helper] Captured delayed baseline display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", current.logical_width, current.logical_height, current.pixel_width, current.pixel_height, current.refresh_rate);
+  } else if (modeChanged) {
+    fprintf(stderr, "[vd_helper] Observed changed virtual-display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", current.logical_width, current.logical_height, current.pixel_width, current.pixel_height, current.refresh_rate);
+  }
+  if (changed) {
+    *changed = modeChanged;
+  }
+
+  if (tracker->has_dirty_mode && saveChangedDisplayMode(request, &tracker->dirty_mode)) {
+    vd_helper_mode_tracker_mark_saved(tracker);
+  }
   return YES;
 }
 
@@ -1091,6 +1175,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
     // Initialize NSApplication
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    [NSApp finishLaunching];
 
     // Create display directly on main thread
     CGVirtualDisplayDescriptor *desc = [[CGVirtualDisplayDescriptor alloc] init];
@@ -1291,15 +1376,44 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper]   ours[%u]: online=%d, active=%d, inMirror=%d, mirrors=%u\n", resultID, CGDisplayIsOnline(resultID), CGDisplayIsActive(resultID), CGDisplayIsInMirrorSet(resultID), CGDisplayMirrorsDisplay(resultID));
     }
 
-    // The holder process has the reliable CoreGraphics mode view. Capture the
-    // post-startup baseline here so a startup fallback is never mistaken for a
-    // user-selected mode during teardown.
-    macos_display_mode_t baselineMode = {};
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
-    const BOOL baselineAvailable = readCurrentDisplayMode(resultID, &baselineMode);
-    if (!baselineAvailable) {
-      fprintf(stderr, "[vd_helper] Could not read a complete baseline display mode; mode persistence disabled for this session\n");
+    // Register before the first snapshot. CoreGraphics guarantees its display
+    // state is current when it delivers a completed reconfiguration callback.
+    display_reconfiguration_context_t reconfigurationContext = {resultID};
+    atomic_init(&reconfigurationContext.mode_change_pending, false);
+    const CGError callbackError = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
+    const BOOL callbackRegistered = callbackError == kCGErrorSuccess;
+    if (!callbackRegistered) {
+      fprintf(stderr, "[vd_helper] Could not register display reconfiguration callback: %d; falling back to polling\n", callbackError);
     }
+
+    // Let activation and exclusive-mode notifications settle. WindowServer can
+    // restore a mode remembered for this serial after the earlier selection, so
+    // enforce the requested effective mode once more before fixing the baseline.
+    pumpApplicationEvents(0.25);
+    macos_display_mode_t settledMode = {};
+    if (readCurrentDisplayMode(resultID, &settledMode) && !vd_helper_effective_mode_matches(&settledMode, &request.effective)) {
+      fprintf(stderr, "[vd_helper] Reapplying requested mode after WindowServer restored %ux%u logical (%ux%u pixels, %.3fHz)\n", settledMode.logical_width, settledMode.logical_height, settledMode.pixel_width, settledMode.pixel_height, settledMode.refresh_rate);
+      (void) selectRequestedDisplayMode(resultID, &request);
+      pumpApplicationEvents(0.25);
+    }
+
+    // Capture the post-startup baseline here so the startup-selected mode is
+    // not mistaken for a user-selected mode during live observation.
+    macos_display_mode_t baselineMode = {};
+    vd_helper_mode_tracker_t modeTracker = {};
+    const BOOL baselineAvailable = readCurrentDisplayMode(resultID, &baselineMode);
+    if (baselineAvailable) {
+      (void) vd_helper_mode_tracker_observe(&modeTracker, &baselineMode, true);
+      fprintf(stderr, "[vd_helper] Captured baseline display mode %ux%u logical (%ux%u pixels, %.3fHz)\n", baselineMode.logical_width, baselineMode.logical_height, baselineMode.pixel_width, baselineMode.pixel_height, baselineMode.refresh_rate);
+    } else {
+      fprintf(stderr, "[vd_helper] Could not read a complete baseline display mode; waiting for a later full snapshot\n");
+    }
+    atomic_store_explicit(&reconfigurationContext.mode_change_pending, false, memory_order_release);
+    const BOOL persistenceAvailable = request.profile_directory && request.certificate_fingerprint && request.profile_directory[0] != '\0' && request.certificate_fingerprint[0] != '\0';
+    if (!persistenceAvailable) {
+      fprintf(stderr, "[vd_helper] Display-mode persistence unavailable because client profile context is absent\n");
+    }
+    BOOL liveReadFailureLogged = NO;
 
     fprintf(stdout, "%u\n", resultID);
     fflush(stdout);
@@ -1311,13 +1425,33 @@ static int runDisplayHolder(int argc, const char *argv[]) {
         shouldExit = 1;
         break;
       }
-      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+      pumpApplicationEvents(1.0);
+      const BOOL callbackPending = atomic_exchange_explicit(&reconfigurationContext.mode_change_pending, false, memory_order_acq_rel);
+      if (callbackPending) {
+        fprintf(stderr, "[vd_helper] Processing display reconfiguration notification\n");
+      }
+      if (persistenceAvailable && !shouldExit) {
+        (void) observeAndPersistDisplayMode(resultID, &request, &modeTracker, callbackPending ? "reconfigured" : "live", &liveReadFailureLogged, NULL);
+      }
     }
 
-    // Snapshot before restoring physical displays or releasing the virtual
-    // display. Geometry-only fallback is intentionally not persisted.
-    if (baselineAvailable) {
-      (void) persistChangedDisplayMode(resultID, &request, &baselineMode);
+    // Take a final full snapshot before restoring physical displays or releasing
+    // the virtual display. An invalid read retains any last valid dirty mode.
+    if (persistenceAvailable) {
+      BOOL finalChanged = NO;
+      const BOOL finalRead = observeAndPersistDisplayMode(resultID, &request, &modeTracker, "shutdown", NULL, &finalChanged);
+      if (finalRead && !finalChanged && !modeTracker.has_dirty_mode) {
+        fprintf(stderr, "[vd_helper] Final virtual-display mode is unchanged since the last valid observation\n");
+      } else if (!finalRead && modeTracker.has_dirty_mode && saveChangedDisplayMode(&request, &modeTracker.dirty_mode)) {
+        vd_helper_mode_tracker_mark_saved(&modeTracker);
+      }
+    }
+
+    if (callbackRegistered) {
+      const CGError removalError = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
+      if (removalError != kCGErrorSuccess) {
+        fprintf(stderr, "[vd_helper] Could not remove display reconfiguration callback: %d\n", removalError);
+      }
     }
 
     if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
