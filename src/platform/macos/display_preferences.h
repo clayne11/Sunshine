@@ -24,7 +24,7 @@ extern "C" {
   typedef struct macos_display_requested_mode_t {
     uint32_t width;  ///< Requested logical width in pixels.
     uint32_t height;  ///< Requested logical height in pixels.
-    uint32_t refresh_rate;  ///< Requested refresh rate in hertz.
+    uint32_t refresh_rate;  ///< Requested refresh rate in hertz; it does not form the preference key.
   } macos_display_requested_mode_t;
 
   /**
@@ -44,23 +44,25 @@ extern "C" {
   } macos_display_mode_t;
 
   /**
-   * @brief A persisted per-client mode preference.
+   * @brief A persisted per-client, per-resolution mode preference.
    */
   typedef struct macos_display_preference_t {
-    macos_display_requested_mode_t requested;  ///< Moonlight tuple that selected this preference.
-    macos_display_mode_t mode;  ///< Explicit mode observed for that tuple.
+    macos_display_requested_mode_t requested;  ///< Moonlight request associated with this preference.
+    macos_display_mode_t mode;  ///< Explicit dimensions and scaling observed for that request.
   } macos_display_preference_t;
 
   /**
    * @brief Load a validated preference for a paired client.
    *
    * A preference is returned only when the file, certificate fingerprint, and
-   * requested tuple all match the supplied values. Missing, malformed, or stale
-   * entries are treated as absent.
+   * requested dimensions match the supplied values. The requested refresh rate
+   * selects the effective refresh rate for the loaded mode, but does not select
+   * a different persisted mapping. Missing, malformed, or stale entries are
+   * treated as absent.
    *
-   * @param profile_directory Directory in which per-client preference files live.
+   * @param profile_directory Directory in which per-client and legacy preference files live.
    * @param certificate_fingerprint SHA-256 certificate fingerprint in lowercase or uppercase hexadecimal.
-   * @param requested Current Moonlight requested tuple.
+   * @param requested Current Moonlight requested dimensions and refresh rate.
    * @param preference Receives the validated preference when one exists.
    * @return True when a matching preference was loaded.
    */
@@ -72,13 +74,13 @@ extern "C" {
   );
 
   /**
-   * @brief Atomically save a per-client mode preference.
+   * @brief Atomically save a per-client, per-resolution mode preference.
    *
    * The file is written beside the final path and then replaced with an atomic
    * same-directory rename. Invalid dimensions, rates, or fingerprints are
    * rejected before any file is changed.
    *
-   * @param profile_directory Directory in which the per-client file is written.
+   * @param profile_directory Directory in which the per-client resolution file is written.
    * @param certificate_fingerprint SHA-256 certificate fingerprint in lowercase or uppercase hexadecimal.
    * @param preference Preference to validate and save.
    * @return True when the preference was written and atomically installed.

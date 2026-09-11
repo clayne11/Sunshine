@@ -32,7 +32,7 @@ extern "C" {
   typedef struct virtual_display_request_t {
     macos_display_requested_mode_t requested;  ///< Current Moonlight request.
     macos_display_mode_t effective;  ///< Mode to offer and select for this connection.
-    uint32_t helper_serial;  ///< Stable display serial derived from the paired client certificate.
+    uint32_t helper_serial;  ///< Stable display serial derived from the paired client certificate and requested resolution.
     const char *profile_directory;  ///< Directory used by the holder to save a changed mode.
     const char *certificate_fingerprint;  ///< Paired client certificate fingerprint, or null when unavailable.
     bool has_preference;  ///< Whether effective came from a validated saved override.

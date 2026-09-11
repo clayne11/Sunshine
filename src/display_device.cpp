@@ -35,6 +35,7 @@
 #endif
 
 #ifdef __APPLE__
+  #include "platform/macos/display_identity.h"
   #include "platform/macos/virtual_display.h"
 
   #include <display_device/macos/display_power.h>
@@ -171,16 +172,21 @@ namespace display_device {
     }
 
     /**
-     * @brief Derive a stable 32-bit display serial from a certificate fingerprint.
+     * @brief Derive a stable 32-bit display serial from a client-resolution identity.
      * @param fingerprint Hexadecimal certificate fingerprint.
+     * @param requested Requested client mode whose dimensions identify the mapping.
      * @return Non-zero serial suitable for a CGVirtualDisplay descriptor.
      */
-    uint32_t display_preferences_serial(std::string_view fingerprint) {
+    uint32_t display_preferences_serial(
+      std::string_view fingerprint,
+      const macos_display_requested_mode_t &requested
+    ) {
       if (fingerprint.empty()) {
         return 0;
       }
 
-      const auto digest {crypto::hash(fingerprint)};
+      const auto identity_key {macos::virtual_display_identity_key(fingerprint, requested)};
+      const auto digest {crypto::hash(identity_key)};
       uint32_t serial {
         (static_cast<uint32_t>(digest[0]) << 24) |
         (static_cast<uint32_t>(digest[1]) << 16) |
@@ -1047,7 +1053,7 @@ namespace display_device {
     virtual_display_request_t display_request {
       requested_mode,
       effective_mode,
-      display_preferences_serial(certificate_fingerprint),
+      display_preferences_serial(certificate_fingerprint, requested_mode),
       profile_directory.empty() || certificate_fingerprint.empty() ? nullptr : profile_directory.c_str(),
       certificate_fingerprint.empty() ? nullptr : certificate_fingerprint.c_str(),
       has_preference,

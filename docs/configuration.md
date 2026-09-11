@@ -1083,8 +1083,9 @@ See [remote microphone setup](remote-microphone.md) for routing and validation.
             capture stream resolves the current virtual display when it starts, allowing a recreated display to be
             captured after reconnect. Host audio uses Sunshine's native capture path.
             A mode changed in macOS Displays during a session is saved for that paired client's certificate and
-            requested width, height, and frame rate. A later connection with the same tuple restores the saved
-            logical and backing-pixel mode. A different client or requested tuple uses its own default or saved mode.
+            requested width and height. Each client-resolution pair keeps its own saved logical and backing-pixel
+            mode. Changing only the frame rate retains that mapping and uses the new connection frame rate.
+            A different client or requested resolution uses its own default or saved mode.
             @note{This option is only supported on macOS.}
         </td>
     </tr>

@@ -79,22 +79,38 @@ namespace {
   }
 
   /**
-   * @brief Check whether two requested tuples identify the same client request.
-   * @param lhs First requested tuple.
-   * @param rhs Second requested tuple.
-   * @return True when all tuple fields match.
+   * @brief Check whether two requested modes identify the same resolution mapping.
+   * @param lhs First requested mode.
+   * @param rhs Second requested mode.
+   * @return True when both logical dimensions match.
    */
-  bool same_requested_mode(const macos_display_requested_mode_t &lhs, const macos_display_requested_mode_t &rhs) {
-    return lhs.width == rhs.width && lhs.height == rhs.height && lhs.refresh_rate == rhs.refresh_rate;
+  bool same_requested_dimensions(const macos_display_requested_mode_t &lhs, const macos_display_requested_mode_t &rhs) {
+    return lhs.width == rhs.width && lhs.height == rhs.height;
   }
 
   /**
-   * @brief Build the per-client preference filename.
+   * @brief Build the current per-client, per-resolution preference filename.
    * @param profile_directory Directory containing preference files.
    * @param fingerprint Canonical client certificate fingerprint.
+   * @param requested Requested logical dimensions.
    * @return Final preference path.
    */
-  std::filesystem::path preference_path(const char *profile_directory, std::string_view fingerprint) {
+  std::filesystem::path preference_path(
+    const char *profile_directory,
+    std::string_view fingerprint,
+    const macos_display_requested_mode_t &requested
+  ) {
+    return std::filesystem::path {profile_directory} /
+           ("display-mode-" + std::string {fingerprint} + "-" + std::to_string(requested.width) + "x" + std::to_string(requested.height) + ".json");
+  }
+
+  /**
+   * @brief Build the legacy one-file preference filename.
+   * @param profile_directory Directory containing preference files.
+   * @param fingerprint Canonical client certificate fingerprint.
+   * @return Legacy preference path.
+   */
+  std::filesystem::path legacy_preference_path(const char *profile_directory, std::string_view fingerprint) {
     return std::filesystem::path {profile_directory} / ("display-mode-" + std::string {fingerprint} + ".json");
   }
 
@@ -210,12 +226,12 @@ namespace {
   }
 
   /**
-   * @brief Read and parse a preference file.
+   * @brief Read and parse a preference file for requested dimensions.
    * @param path Preference file path.
    * @param fingerprint Canonical certificate fingerprint.
-   * @param requested Current requested tuple.
+   * @param requested Current requested mode.
    * @param preference Receives the parsed preference.
-   * @return True when the file is valid and matches this client request.
+   * @return True when the file is valid and matches this client's dimensions.
    */
   bool read_preference(
     const std::filesystem::path &path,
@@ -236,12 +252,17 @@ namespace {
 
       macos_display_requested_mode_t stored_requested {};
       macos_display_mode_t stored_mode {};
-      if (!requested_from_json(root.at("requested"), stored_requested) || !mode_from_json(root.at("mode"), stored_mode) || !same_requested_mode(stored_requested, requested)) {
+      if (!requested_from_json(root.at("requested"), stored_requested) || !mode_from_json(root.at("mode"), stored_mode) || !same_requested_dimensions(stored_requested, requested)) {
         return false;
       }
 
-      preference.requested = stored_requested;
+      // Refresh rate is part of the current request, rather than the mapping
+      // key. A client may request the same resolution at a different rate and
+      // must retain the saved dimensions and HiDPI choice while using its
+      // current rate for the effective mode.
+      preference.requested = requested;
       preference.mode = stored_mode;
+      preference.mode.refresh_rate = static_cast<double>(requested.refresh_rate);
       return true;
     } catch (const json::exception &) {
       return false;
@@ -262,7 +283,19 @@ extern "C" bool macos_display_preferences_load(
   }
 
   const std::string fingerprint {canonical_fingerprint(certificate_fingerprint)};
-  return read_preference(preference_path(profile_directory, fingerprint), fingerprint, *requested, *preference);
+  const std::filesystem::path current_path {preference_path(profile_directory, fingerprint, *requested)};
+  std::error_code error;
+  const bool current_exists = std::filesystem::exists(current_path, error);
+  if (error) {
+    return false;
+  }
+  if (current_exists) {
+    // A present but malformed current entry must not resurrect an older legacy
+    // entry for the same dimensions.
+    return read_preference(current_path, fingerprint, *requested, *preference);
+  }
+
+  return read_preference(legacy_preference_path(profile_directory, fingerprint), fingerprint, *requested, *preference);
 }
 
 extern "C" bool macos_display_preferences_save(
@@ -282,7 +315,7 @@ extern "C" bool macos_display_preferences_save(
     return false;
   }
 
-  const std::filesystem::path destination {preference_path(profile_directory, fingerprint)};
+  const std::filesystem::path destination {preference_path(profile_directory, fingerprint, preference->requested)};
   const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
   const std::filesystem::path temporary {destination.string() + ".tmp-" + std::to_string(getpid()) + "-" + std::to_string(timestamp)};
   const json root {
