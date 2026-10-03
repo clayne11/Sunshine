@@ -229,6 +229,7 @@ static BOOL installSignalHandlers(void) {
 /** @brief Callback state for one holder-owned virtual display. */
 typedef struct display_reconfiguration_context_t {
   CGDirectDisplayID display_id;  ///< Virtual display whose configuration is tracked.
+  BOOL exclusive;  ///< Whether any display reconfiguration can invalidate topology.
   atomic_bool mode_change_pending;  ///< Whether CoreGraphics delivered a completed reconfiguration.
 } display_reconfiguration_context_t;
 
@@ -240,7 +241,7 @@ typedef struct display_reconfiguration_context_t {
  */
 static void displayReconfigurationCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
   display_reconfiguration_context_t *context = userInfo;
-  if (!context || display != context->display_id || (flags & kCGDisplayBeginConfigurationFlag) != 0) {
+  if (!context || (display != context->display_id && !context->exclusive) || (flags & kCGDisplayBeginConfigurationFlag) != 0) {
     return;
   }
   atomic_store_explicit(&context->mode_change_pending, true, memory_order_release);
@@ -458,6 +459,130 @@ static BOOL displayIDIsInList(const CGDirectDisplayID *displays, uint32_t displa
 }
 
 /**
+ * @brief Add newly observed physical displays to the holder's restore snapshot.
+ * @param virtualID Virtual display to exclude.
+ * @param currentIDs Online or active display IDs observed during repair.
+ * @param currentCount Number of entries in currentIDs.
+ * @param activeIDs Current active display IDs.
+ * @param activeCount Number of entries in activeIDs.
+ * @return YES when the snapshot has room for every newly observed display.
+ */
+static BOOL rememberNewDisplays(
+  CGDirectDisplayID virtualID,
+  const CGDirectDisplayID *currentIDs,
+  uint32_t currentCount,
+  const CGDirectDisplayID *activeIDs,
+  uint32_t activeCount
+) {
+  const uint32_t capacity = (uint32_t) (sizeof(originalOnlineDisplayIDs) / sizeof(originalOnlineDisplayIDs[0]));
+  uint32_t newOnlineCount = 0;
+  uint32_t newActiveCount = 0;
+  for (uint32_t index = 0; index < currentCount; ++index) {
+    const CGDirectDisplayID displayID = currentIDs[index];
+    if (displayID == virtualID || isKnownTransientVirtualDisplay(displayID) || displayIDIsInList(originalOnlineDisplayIDs, originalOnlineDisplayCount, displayID)) {
+      continue;
+    }
+    ++newOnlineCount;
+    if (displayIDIsInList(activeIDs, activeCount, displayID) && !displayIDIsInList(originalDisplayIDs, originalDisplayCount, displayID)) {
+      ++newActiveCount;
+    }
+  }
+  if (originalOnlineDisplayCount + newOnlineCount > capacity || originalDisplayCount + newActiveCount > capacity) {
+    fprintf(stderr, "[vd_helper] Display restore snapshot is full; refusing incomplete exclusive repair\n");
+    return NO;
+  }
+
+  for (uint32_t index = 0; index < currentCount; ++index) {
+    const CGDirectDisplayID displayID = currentIDs[index];
+    if (displayID == virtualID || isKnownTransientVirtualDisplay(displayID) || displayIDIsInList(originalOnlineDisplayIDs, originalOnlineDisplayCount, displayID)) {
+      continue;
+    }
+    originalOnlineDisplayIDs[originalOnlineDisplayCount++] = displayID;
+    if (displayIDIsInList(activeIDs, activeCount, displayID)) {
+      if (!displayIDIsInList(originalDisplayIDs, originalDisplayCount, displayID)) {
+        originalDisplayIDs[originalDisplayCount++] = displayID;
+        fprintf(stderr, "[vd_helper] Added newly active display %u to the restore snapshot\n", displayID);
+      }
+    } else {
+      fprintf(stderr, "[vd_helper] Added newly online display %u to the restore snapshot\n", displayID);
+    }
+  }
+  return YES;
+}
+
+/**
+ * @brief Read current online and active displays and extend recovery bookkeeping.
+ * @param virtualID Virtual display to exclude from the physical lists.
+ * @param currentIDs Receives the combined online and active display IDs to disable.
+ * @param currentCount Receives the number of entries in currentIDs.
+ * @return YES when both snapshots are complete and can be restored later.
+ */
+static BOOL currentPhysicalDisplays(CGDirectDisplayID virtualID, CGDirectDisplayID currentIDs[64], uint32_t *currentCount) {
+  CGDirectDisplayID onlineIDs[64];
+  CGDirectDisplayID activeIDs[64];
+  uint32_t onlineCount = 0;
+  uint32_t activeCount = 0;
+  if (CGGetOnlineDisplayList(64, onlineIDs, &onlineCount) != kCGErrorSuccess || CGGetActiveDisplayList(64, activeIDs, &activeCount) != kCGErrorSuccess) {
+    fprintf(stderr, "[vd_helper] Could not enumerate current displays for exclusive repair\n");
+    return NO;
+  }
+  if (onlineCount > 64 || activeCount > 64) {
+    fprintf(stderr, "[vd_helper] Current display topology exceeds exclusive-repair capacity\n");
+    return NO;
+  }
+
+  uint32_t count = 0;
+  for (uint32_t index = 0; index < onlineCount; ++index) {
+    const CGDirectDisplayID displayID = onlineIDs[index];
+    if (displayID != virtualID && !isKnownTransientVirtualDisplay(displayID) && !displayIDIsInList(currentIDs, count, displayID)) {
+      if (count >= 64) {
+        fprintf(stderr, "[vd_helper] Current display list exceeds exclusive-repair capacity\n");
+        return NO;
+      }
+      currentIDs[count++] = displayID;
+    }
+  }
+  for (uint32_t index = 0; index < activeCount; ++index) {
+    const CGDirectDisplayID displayID = activeIDs[index];
+    if (displayID != virtualID && !isKnownTransientVirtualDisplay(displayID) && !displayIDIsInList(currentIDs, count, displayID)) {
+      if (count >= 64) {
+        fprintf(stderr, "[vd_helper] Current display list exceeds exclusive-repair capacity\n");
+        return NO;
+      }
+      currentIDs[count++] = displayID;
+    }
+  }
+  if (!rememberNewDisplays(virtualID, currentIDs, count, activeIDs, activeCount)) {
+    return NO;
+  }
+  *currentCount = count;
+  return YES;
+}
+
+/**
+ * @brief Refresh the guardian's recovery snapshot after its holder has stopped.
+ * @param virtualID Virtual display to exclude.
+ * @return YES when the post-holder display topology was captured.
+ * @details App-only display changes roll back with the holder process. Capture
+ *          the resulting topology so the guardian recognizes late-online screens.
+ */
+static BOOL refreshRecoveryDisplaySnapshot(CGDirectDisplayID virtualID) {
+  CGDirectDisplayID currentIDs[64];
+  uint32_t currentCount = 0;
+  return currentPhysicalDisplays(virtualID, currentIDs, &currentCount);
+}
+
+/**
+ * @brief Check whether the virtual display has the required sole-display origin.
+ * @param virtualID Virtual display identifier.
+ * @return YES when its desktop origin is (0, 0).
+ */
+static BOOL virtualDisplayIsAtOrigin(CGDirectDisplayID virtualID) {
+  const CGRect bounds = CGDisplayBounds(virtualID);
+  return bounds.origin.x == 0.0 && bounds.origin.y == 0.0;
+}
+
+/**
  * @brief Check that physical active displays match the saved snapshot.
  * @param virtualID Virtual display identifier to ignore while it is still held by the helper.
  * @return YES when the active displays, excluding virtualID, exactly match the saved snapshot.
@@ -620,10 +745,16 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   // requested strict virtual-only state.  Do not reopen a configuration just
   // to disable physical displays that are already inactive.
   pumpApplicationEvents(0.05);
-  if (onlyVirtualDisplayActive(virtualID)) {
+  if (onlyVirtualDisplayActive(virtualID) && virtualDisplayIsAtOrigin(virtualID)) {
     fprintf(stderr, "[vd_helper] Exclusive display state is already active; skipping configuration transaction\n");
     exclusiveApplied = YES;
     return YES;
+  }
+
+  CGDirectDisplayID currentIDs[64];
+  uint32_t currentCount = 0;
+  if (!currentPhysicalDisplays(virtualID, currentIDs, &currentCount)) {
+    return NO;
   }
 
   CGDisplayConfigRef config = NULL;
@@ -634,11 +765,11 @@ static BOOL applyExclusiveMode(CGDirectDisplayID virtualID) {
   }
 
   error = kCGErrorSuccess;
-  for (uint32_t i = 0; error == kCGErrorSuccess && i < originalOnlineDisplayCount; ++i) {
-    if (originalOnlineDisplayIDs[i] == virtualID) {
-      continue;
-    }
-    error = SLSConfigureDisplayEnabled(config, originalOnlineDisplayIDs[i], false);
+  for (uint32_t i = 0; error == kCGErrorSuccess && i < currentCount; ++i) {
+    error = SLSConfigureDisplayEnabled(config, currentIDs[i], false);
+  }
+  if (error == kCGErrorSuccess) {
+    error = CGConfigureDisplayOrigin(config, virtualID, 0, 0);
   }
 
   if (error != kCGErrorSuccess) {
@@ -1133,6 +1264,65 @@ static BOOL observeAndPersistDisplayMode(
 }
 
 /**
+ * @brief Restore and verify the exclusive display state before live observation.
+ * @param displayID Virtual display identifier.
+ * @param request Current display request.
+ * @param tracker Last stable mode snapshot.
+ * @param modeRecoveryPending Retains an incomplete recovery across polling passes.
+ * @return YES when topology is safe for mode observation and persistence.
+ */
+static BOOL repairExclusiveStateBeforeObservation(
+  CGDirectDisplayID displayID,
+  const display_request_t *request,
+  const vd_helper_mode_tracker_t *tracker,
+  BOOL *modeRecoveryPending
+) {
+  if (!request || !modeRecoveryPending || !request->exclusive) {
+    return YES;
+  }
+  const BOOL topologyAlreadyExclusive = onlyVirtualDisplayActive(displayID) && virtualDisplayIsAtOrigin(displayID);
+  if (topologyAlreadyExclusive && !*modeRecoveryPending) {
+    return YES;
+  }
+
+  if (!topologyAlreadyExclusive) {
+    *modeRecoveryPending = YES;
+    fprintf(stderr, "[vd_helper] Exclusive display topology drifted; repairing before mode observation\n");
+    if (!applyExclusiveMode(displayID)) {
+      fprintf(stderr, "[vd_helper] Exclusive display repair failed; skipping mode observation\n");
+      return NO;
+    }
+  }
+
+  const macos_display_mode_t *stableMode = vd_helper_mode_tracker_recovery_mode(tracker, &request->effective);
+  macos_display_mode_t currentMode = {};
+  if (!stableMode || !readCurrentDisplayMode(displayID, &currentMode)) {
+    fprintf(stderr, "[vd_helper] Could not verify virtual-display mode after topology repair\n");
+    return NO;
+  }
+  if (!vd_helper_effective_mode_matches(&currentMode, stableMode)) {
+    fprintf(stderr, "[vd_helper] Restoring last stable virtual-display mode %ux%u logical (%ux%u pixels, %.3fHz) after topology repair\n", stableMode->logical_width, stableMode->logical_height, stableMode->pixel_width, stableMode->pixel_height, stableMode->refresh_rate);
+    display_request_t recoveryRequest = *request;
+    recoveryRequest.effective = *stableMode;
+    if (!selectRequestedDisplayMode(displayID, &recoveryRequest)) {
+      fprintf(stderr, "[vd_helper] Could not restore last stable virtual-display mode\n");
+      return NO;
+    }
+    pumpApplicationEvents(0.25);
+    if (!readCurrentDisplayMode(displayID, &currentMode) || !vd_helper_effective_mode_matches(&currentMode, stableMode)) {
+      fprintf(stderr, "[vd_helper] Restored virtual-display mode did not match the last stable snapshot\n");
+      return NO;
+    }
+  }
+  if (!onlyVirtualDisplayActive(displayID) || !virtualDisplayIsAtOrigin(displayID)) {
+    fprintf(stderr, "[vd_helper] Exclusive display topology changed again during repair; skipping mode observation\n");
+    return NO;
+  }
+  *modeRecoveryPending = NO;
+  return YES;
+}
+
+/**
  * @brief Create and hold a virtual display until its guardian requests shutdown.
  * @param argc Argument count.
  * @param argv Width, height, refresh rate, and optional display mode.
@@ -1285,7 +1475,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
 
     // Register before activation so pumping AppKit events also refreshes
     // process-local CoreGraphics state for startup display transactions.
-    display_reconfiguration_context_t reconfigurationContext = {resultID};
+    display_reconfiguration_context_t reconfigurationContext = {resultID, request.exclusive};
     atomic_init(&reconfigurationContext.mode_change_pending, false);
     const CGError callbackError = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, &reconfigurationContext);
     const BOOL callbackRegistered = callbackError == kCGErrorSuccess;
@@ -1442,6 +1632,7 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       fprintf(stderr, "[vd_helper] Display-mode persistence unavailable because client profile context is absent\n");
     }
     BOOL liveReadFailureLogged = NO;
+    BOOL modeRecoveryPending = NO;
 
     fprintf(stdout, "%u\n", resultID);
     fflush(stdout);
@@ -1458,14 +1649,17 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       if (callbackPending) {
         fprintf(stderr, "[vd_helper] Processing display reconfiguration notification\n");
       }
-      if (persistenceAvailable && !shouldExit) {
+      const BOOL topologyReady = !shouldExit && repairExclusiveStateBeforeObservation(resultID, &request, &modeTracker, &modeRecoveryPending);
+      if (persistenceAvailable && topologyReady && !shouldExit) {
         (void) observeAndPersistDisplayMode(resultID, &request, &modeTracker, callbackPending ? "reconfigured" : "live", &liveReadFailureLogged, NULL);
       }
     }
 
-    // Take a final full snapshot before restoring physical displays or releasing
-    // the virtual display. An invalid read retains any last valid dirty mode.
-    if (persistenceAvailable) {
+    // Only persist a final snapshot while the exclusive topology is still
+    // valid. A mode read after shutdown drift can describe an automatic reset.
+    const BOOL finalTopologyReady = !request.exclusive ||
+                                    (!modeRecoveryPending && onlyVirtualDisplayActive(resultID) && virtualDisplayIsAtOrigin(resultID));
+    if (persistenceAvailable && finalTopologyReady) {
       BOOL finalChanged = NO;
       const BOOL finalRead = observeAndPersistDisplayMode(resultID, &request, &modeTracker, "shutdown", NULL, &finalChanged);
       if (finalRead && !finalChanged && !modeTracker.has_dirty_mode) {
@@ -1473,6 +1667,8 @@ static int runDisplayHolder(int argc, const char *argv[]) {
       } else if (!finalRead && modeTracker.has_dirty_mode && saveChangedDisplayMode(&request, &modeTracker.dirty_mode)) {
         vd_helper_mode_tracker_mark_saved(&modeTracker);
       }
+    } else if (persistenceAvailable) {
+      fprintf(stderr, "[vd_helper] Skipping final mode persistence because exclusive topology is invalid during shutdown\n");
     }
 
     if (exclusiveApplied && !restoreOriginalDisplays(resultID, kCGConfigureForAppOnly)) {
@@ -1679,8 +1875,13 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
     if (!holderReaped && !vd_terminate_and_reap(holderPID, 40, 20, 100000, &holderStatus)) {
       fprintf(stderr, "[vd_helper] Guardian could not reap failed holder pid=%d\n", holderPID);
     }
-    if (request.exclusive && !recoverOriginalDisplays(displayID)) {
-      fprintf(stderr, "[vd_helper] Guardian recovery after holder startup failure failed\n");
+    if (request.exclusive) {
+      if (!refreshRecoveryDisplaySnapshot(displayID)) {
+        fprintf(stderr, "[vd_helper] Guardian could not refresh the recovery snapshot after holder startup failure\n");
+      }
+      if (!recoverOriginalDisplays(displayID)) {
+        fprintf(stderr, "[vd_helper] Guardian recovery after holder startup failure failed\n");
+      }
     }
     if (!shouldExit && parentIsAlive()) {
       writeGuardianDisplayID(0);
@@ -1715,6 +1916,9 @@ static int runDisplayGuardian(int argc, const char *argv[]) {
 
   BOOL restored = YES;
   if (request.exclusive) {
+    if (!refreshRecoveryDisplaySnapshot(displayID)) {
+      fprintf(stderr, "[vd_helper] Guardian could not refresh the recovery snapshot after holder shutdown\n");
+    }
     restored = recoverOriginalDisplays(displayID);
     if (!restored) {
       fprintf(stderr, "[vd_helper] Guardian could not restore the saved physical displays\n");

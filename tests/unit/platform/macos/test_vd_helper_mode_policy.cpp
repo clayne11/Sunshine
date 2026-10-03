@@ -94,3 +94,33 @@ TEST(VirtualDisplayModePolicy, FailedSaveCanRemainDirtyForRetry) {
   EXPECT_FALSE(vd_helper_mode_tracker_observe(&tracker, &scaled, true));
   EXPECT_TRUE(tracker.has_dirty_mode);
 }
+
+TEST(VirtualDisplayModePolicy, TopologyDriftKeepsLastStableModeUntilExclusiveObservationChangesIt) {
+  vd_helper_mode_tracker_t tracker {};
+  const auto requested = mode(2420, 1668, 2420, 1668, 30.0, false);
+  const auto stableHiDpi = mode(1210, 834, 2420, 1668, 30.0, true);
+  const auto automaticNativeReset = mode(2420, 1668, 2420, 1668, 30.0, false);
+  const auto explicitUserMode = mode(960, 540, 1920, 1080, 30.0, true);
+
+  ASSERT_FALSE(vd_helper_mode_tracker_observe(&tracker, &stableHiDpi, true));
+
+  // The live caller rejects observations while topology is drifting. The
+  // recovery target therefore remains the last known user-selected mapping.
+  EXPECT_EQ(vd_helper_mode_tracker_recovery_mode(&tracker, &requested)->logical_width, 1210U);
+  EXPECT_FALSE(tracker.has_dirty_mode);
+  EXPECT_EQ(automaticNativeReset.logical_width, 2420U);
+
+  // Once topology is exclusive again, a user-selected mode is observed and
+  // becomes the new recovery target and persistence candidate.
+  EXPECT_TRUE(vd_helper_mode_tracker_observe(&tracker, &explicitUserMode, true));
+  ASSERT_TRUE(tracker.has_dirty_mode);
+  EXPECT_EQ(vd_helper_mode_tracker_recovery_mode(&tracker, &requested)->logical_width, 960U);
+}
+
+TEST(VirtualDisplayModePolicy, RecoveryModeUsesRequestedFallbackBeforeFirstObservation) {
+  vd_helper_mode_tracker_t tracker {};
+  const auto requested = mode(2420, 1668, 2420, 1668, 30.0, false);
+
+  EXPECT_EQ(vd_helper_mode_tracker_recovery_mode(&tracker, &requested), &requested);
+  EXPECT_EQ(vd_helper_mode_tracker_recovery_mode(&tracker, nullptr), nullptr);
+}

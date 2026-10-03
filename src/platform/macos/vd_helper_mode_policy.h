@@ -35,6 +35,22 @@ extern "C" {
   }
 
   /**
+   * @brief Choose the last stable live mode to restore after display-topology drift.
+   * @param tracker Mode observations retained for the current holder session.
+   * @param fallback Requested startup mode used before the first complete observation.
+   * @return Last stable observation when available, otherwise fallback, or null.
+   */
+  static inline const macos_display_mode_t *vd_helper_mode_tracker_recovery_mode(
+    const vd_helper_mode_tracker_t *tracker,
+    const macos_display_mode_t *fallback
+  ) {
+    if (tracker && tracker->has_last_observed) {
+      return &tracker->last_observed;
+    }
+    return fallback;
+  }
+
+  /**
    * @brief Check whether an observed mode satisfies the requested effective mode.
    * @param observed Complete mode reported by CoreGraphics.
    * @param effective Requested logical, backing, scaling, and refresh mode.
